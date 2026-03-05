@@ -4068,4 +4068,50 @@ export const editorTools = [
     handler: async (params) =>
       JSON.stringify(await bridge.getAgentLog(params), null, 2),
   },
+
+  // ─── MPPM Scenario Management ───
+  // These are NOT in CORE_TOOLS, so they automatically become advanced/lazy-loaded
+  // tools accessible via unity_advanced_tool, keeping the exposed tool count low.
+  {
+    name: "unity_mppm_list_scenarios",
+    description: "List all MPPM (Multiplayer PlayMode) scenarios in the project with details about instances and configurations.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/list", {}), null, 2),
+  },
+  {
+    name: "unity_mppm_status",
+    description: "Get the current scenario status including running state, active scenario name, and progress.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/status", {}), null, 2),
+  },
+  {
+    name: "unity_mppm_activate_scenario",
+    description: "Load/activate a specific scenario by its asset path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path to the scenario (e.g., 'Assets/MPPM/Scenarios/MyScenario.asset')" },
+      },
+      required: ["path"],
+    },
+    handler: async ({ path }) => JSON.stringify(await bridge.sendCommand("scenario/activate", { path }), null, 2),
+  },
+  {
+    name: "unity_mppm_start",
+    description: "Start the currently active scenario.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/start", {}), null, 2),
+  },
+  {
+    name: "unity_mppm_stop",
+    description: "Stop the running scenario.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/stop", {}), null, 2),
+  },
+  {
+    name: "unity_mppm_info",
+    description: "Get multiplayer play mode information including CurrentPlayer state, tags, and MPPM package version.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/info", {}), null, 2),
+  },
 ];

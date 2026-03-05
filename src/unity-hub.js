@@ -9,20 +9,37 @@ const execFileAsync = promisify(execFile);
  * Execute a Unity Hub CLI command
  */
 async function runHubCommand(args, timeoutMs = 30000) {
-  const fullArgs = ["--", "--headless", ...args];
+  const hubPath = CONFIG.unityHubPath;
+
+  // Try modern syntax first (no '--' prefix, works with Unity Hub 3.x+)
+  const modernArgs = ["--headless", ...args];
   try {
-    const { stdout, stderr } = await execFileAsync(CONFIG.unityHubPath, fullArgs, {
+    const { stdout, stderr } = await execFileAsync(hubPath, modernArgs, {
       timeout: timeoutMs,
       windowsHide: true,
     });
     return { success: true, stdout: stdout.trim(), stderr: stderr.trim() };
   } catch (error) {
-    return {
-      success: false,
-      error: error.message,
-      stdout: error.stdout?.trim() || "",
-      stderr: error.stderr?.trim() || "",
-    };
+    // If modern syntax fails, try legacy syntax with '--' prefix (Unity Hub 2.x)
+    const legacyArgs = ["--", "--headless", ...args];
+    try {
+      const { stdout, stderr } = await execFileAsync(hubPath, legacyArgs, {
+        timeout: timeoutMs,
+        windowsHide: true,
+      });
+      return { success: true, stdout: stdout.trim(), stderr: stderr.trim() };
+    } catch (legacyError) {
+      const msg = error.message || legacyError.message;
+      const hint = msg.includes("ENOENT")
+        ? ` Unity Hub not found at "${hubPath}". Set UNITY_HUB_PATH environment variable to the correct path.`
+        : "";
+      return {
+        success: false,
+        error: msg + hint,
+        stdout: error.stdout?.trim() || legacyError.stdout?.trim() || "",
+        stderr: error.stderr?.trim() || legacyError.stderr?.trim() || "",
+      };
+    }
   }
 }
 
