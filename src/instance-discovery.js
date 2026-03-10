@@ -20,14 +20,19 @@ let _instanceSelectionRequired = false;
   try {
     const persisted = loadState("selectedInstance");
     if (persisted && persisted.port) {
+      // Store as tentative — will be validated on first use via validateSelectedInstance()
       _selectedInstance = persisted;
+      _needsIdentityValidation = true;
       _instanceSelectionRequired = false;
-      debugLog(`Restored persisted instance: ${persisted.projectName} (port ${persisted.port})`);
+      debugLog(`Restored persisted instance (pending validation): ${persisted.projectName} (port ${persisted.port})`);
     }
   } catch {
     // Ignore — fresh start
   }
 })();
+
+// Flag: when true, the restored selection needs identity validation before use
+let _needsIdentityValidation = false;
 
 /**
  * Get the currently selected Unity instance for this session.
@@ -41,11 +46,76 @@ export function getSelectedInstance() {
   const persisted = loadState("selectedInstance");
   if (persisted && persisted.port) {
     _selectedInstance = persisted;
+    _needsIdentityValidation = true;
     _instanceSelectionRequired = false;
     debugLog(`getSelectedInstance: restored from persistence — port ${persisted.port}`);
     return _selectedInstance;
   }
 
+  return null;
+}
+
+/**
+ * Validate that the currently selected instance still hosts the expected project.
+ * Detects port swapping: if ProjectA was on port 7891 but now ProjectB is there,
+ * re-discovers instances and re-selects by matching projectPath.
+ *
+ * This MUST be called before the first tool execution after a process restart.
+ * @returns {object|null} Validated instance, or null if validation cleared the selection.
+ */
+export async function validateSelectedInstance() {
+  if (!_needsIdentityValidation || !_selectedInstance) {
+    _needsIdentityValidation = false;
+    return _selectedInstance;
+  }
+
+  _needsIdentityValidation = false;
+  const saved = _selectedInstance;
+  const savedPath = saved.projectPath;
+  const savedPort = saved.port;
+
+  debugLog(`Validating persisted selection: ${saved.projectName} expected on port ${savedPort}`);
+
+  // Ping the saved port and check what project is actually there
+  const alive = await pingInstance(savedPort);
+  if (alive) {
+    const info = await getInstanceInfo(savedPort);
+    if (info && info.projectPath && info.projectPath === savedPath) {
+      debugLog(`Validation OK: port ${savedPort} still hosts ${saved.projectName}`);
+      return _selectedInstance;
+    }
+
+    if (info && info.projectPath) {
+      // PORT SWAP DETECTED: a different project is on the saved port
+      debugLog(`⚠ Port swap detected! Port ${savedPort} now hosts "${info.projectName}" (expected "${saved.projectName}")`);
+      console.error(
+        `[MCP Discovery] Port swap detected: port ${savedPort} now hosts "${info.projectName}" instead of "${saved.projectName}". Re-discovering...`
+      );
+    }
+  } else {
+    debugLog(`Port ${savedPort} is no longer alive — re-discovering...`);
+  }
+
+  // Re-discover all instances and find the one matching our saved projectPath
+  const instances = await discoverInstances();
+  const match = instances.find(
+    (inst) => inst.projectPath && inst.projectPath === savedPath
+  );
+
+  if (match) {
+    debugLog(`Re-selected ${saved.projectName} on new port ${match.port} (was ${savedPort})`);
+    _selectedInstance = match;
+    _instanceSelectionRequired = false;
+    persistState("selectedInstance", match);
+    persistState("instanceSelectionRequired", false);
+    return _selectedInstance;
+  }
+
+  // Project no longer running — clear selection
+  debugLog(`Project "${saved.projectName}" no longer found. Clearing selection.`);
+  _selectedInstance = null;
+  _instanceSelectionRequired = false;
+  persistState("selectedInstance", null);
   return null;
 }
 
