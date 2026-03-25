@@ -20,6 +20,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that gi
 | **Scripts** | Create, read, update C# scripts |
 | **Builds** | Multi-platform builds (Windows, macOS, Linux, Android, iOS, WebGL) |
 | **Console & Compilation** | Read/clear Unity console logs (errors, warnings, info); get C# compilation errors via CompilationPipeline (independent of console buffer) |
+| **Testing** | Run EditMode/PlayMode tests, poll results, list available tests via Unity Test Runner API |
 | **Play Mode** | Play, pause, stop |
 | **Editor** | Execute menu items, run C# code, get editor state, undo/redo |
 | **Project** | Project info, packages (list/add/remove/search), render pipeline, build settings |
