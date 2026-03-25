@@ -416,4 +416,212 @@ export const umaTools = [
     handler: async (params) =>
       JSON.stringify(await bridge.umaWardrobeEquip(params), null, 2),
   },
+  {
+    name: "unity_uma_edit_race",
+    description:
+      "Edit properties of an existing UMA RaceData asset. Supports renaming (with automatic cascade " +
+      "to all WardrobeRecipes, base recipe, and DCA in scene), modifying wardrobe slots, physics " +
+      "properties, tags, and cross-compatibility settings.\n\n" +
+      "RENAME CASCADE: When newRaceName is provided, automatically updates:\n" +
+      "- The base recipe (compatibleRaces + recipeString JSON)\n" +
+      "- All UMATextRecipe/WardrobeRecipe whose compatibleRaces or recipeString references the old name\n" +
+      "- All DynamicCharacterAvatars in the current scene (activeRace.name)\n" +
+      "- The .asset filename on disk\n" +
+      "- The UMA Global Library\n\n" +
+      "EXAMPLE (rename):\n" +
+      '{ "raceName": "HumanRace", "newRaceName": "HumanMaleRace" }\n\n' +
+      "EXAMPLE (add wardrobe slot):\n" +
+      '{ "raceName": "HumanMaleRace", "addWardrobeSlots": ["TorsoAdditional"] }\n\n' +
+      "EXAMPLE (full edit):\n" +
+      '{ "raceName": "HumanRace", "newRaceName": "HumanMaleRace", ' +
+      '"raceHeight": 1.8, "tags": ["playable", "male"] }',
+    inputSchema: {
+      type: "object",
+      properties: {
+        raceName: {
+          type: "string",
+          description:
+            "Current race name to edit (looked up in Global Library). Provide this OR racePath.",
+        },
+        racePath: {
+          type: "string",
+          description:
+            "Direct asset path to the RaceData (e.g. 'Assets/.../HumanRace.asset'). Alternative to raceName.",
+        },
+        newRaceName: {
+          type: "string",
+          description:
+            "New name for the race. Triggers cascade update on all recipes, DCA, and asset file.",
+        },
+        wardrobeSlots: {
+          type: "array",
+          description:
+            "Complete replacement of wardrobe slot list. Mutually exclusive with addWardrobeSlots/removeWardrobeSlots.",
+          items: { type: "string" },
+        },
+        addWardrobeSlots: {
+          type: "array",
+          description: "Slots to add to the existing list (no duplicates).",
+          items: { type: "string" },
+        },
+        removeWardrobeSlots: {
+          type: "array",
+          description: "Slots to remove from the existing list.",
+          items: { type: "string" },
+        },
+        umaTarget: {
+          type: "string",
+          description: "'Humanoid' or 'Generic'.",
+          enum: ["Humanoid", "Generic"],
+        },
+        fixupRotations: {
+          type: "boolean",
+          description: "Set to true for Blender FBX slots.",
+        },
+        tags: {
+          type: "array",
+          description: "Replace all tags on the race.",
+          items: { type: "string" },
+        },
+        backwardsCompatibleWith: {
+          type: "array",
+          description: "Race names this race is cross-compatible with.",
+          items: { type: "string" },
+        },
+        raceHeight: { type: "number", description: "Race default height." },
+        raceRadius: { type: "number", description: "Race default radius." },
+        raceMass: { type: "number", description: "Race default mass." },
+        baseRaceRecipePath: {
+          type: "string",
+          description:
+            "Asset path to a new base race recipe (UMATextRecipe) to assign. Only if changing the base recipe reference.",
+        },
+        updateRecipes: {
+          type: "boolean",
+          description:
+            "When renaming, update compatibleRaces + recipeString in all recipes (default: true).",
+        },
+        updateDCA: {
+          type: "boolean",
+          description:
+            "When renaming, update DCA in current scene (default: true).",
+        },
+        renameAssetFile: {
+          type: "boolean",
+          description:
+            "When renaming, also rename the .asset file on disk (default: true).",
+        },
+        rebuildLibrary: {
+          type: "boolean",
+          description:
+            "Rebuild UMA Global Library after modifications (default: true).",
+        },
+      },
+    },
+    handler: async (params) =>
+      JSON.stringify(await bridge.umaEditRace(params), null, 2),
+  },
+  {
+    name: "unity_uma_create_race",
+    description:
+      "Create a new UMA RaceData asset. Two modes:\n\n" +
+      "DUPLICATE MODE (recommended): Provide sourceRaceName to copy all settings from an existing race. " +
+      "The base recipe is automatically duplicated with the new race name in recipeString and compatibleRaces. " +
+      "Any optional parameter overrides the duplicated value.\n\n" +
+      "SCRATCH MODE: Omit sourceRaceName to create from scratch with sensible defaults " +
+      "(Humanoid, standard wardrobe slots, default physics). No base recipe is created — assign one via edit_race.\n\n" +
+      "EXAMPLE (duplicate):\n" +
+      '{ "raceName": "HumanFemaleRace", "sourceRaceName": "HumanMaleRace" }\n\n' +
+      "EXAMPLE (duplicate with overrides):\n" +
+      '{ "raceName": "HumanFemaleRace", "sourceRaceName": "HumanMaleRace", ' +
+      '"raceHeight": 1.85, "tags": ["playable", "female"] }\n\n' +
+      "EXAMPLE (from scratch):\n" +
+      '{ "raceName": "DwarfRace", "outputFolder": "Assets/UMA/Races", ' +
+      '"wardrobeSlots": ["Chest", "Legs", "Feet", "Helmet"], "raceHeight": 1.2 }\n\n' +
+      "FBX MODE: Provide fbxPath + umaMaterialPath to create a full race from an FBX body mesh. " +
+      "Inspects the FBX, creates body SlotDataAssets (one per SMR), OverlayDataAssets with auto-detected " +
+      "textures, and assembles a base race recipe (UMATextRecipe). Optionally combine with sourceRaceName " +
+      "to copy wardrobeSlots/physics from an existing race.\n\n" +
+      "EXAMPLE (FBX mode):\n" +
+      '{ "raceName": "HumanFemaleRace", "fbxPath": "Assets/.../SK_Hu_F_FullBody.fbx", ' +
+      '"umaMaterialPath": "Assets/.../UMA_ClothesBase.asset", "outputFolder": "Assets/UMA/Races/Female" }\n\n' +
+      "EXAMPLE (FBX + copy settings from existing race):\n" +
+      '{ "raceName": "HumanFemaleRace", "sourceRaceName": "HumanMaleRace", ' +
+      '"fbxPath": "Assets/.../SK_Hu_F_FullBody.fbx", "umaMaterialPath": "Assets/.../UMA_ClothesBase.asset" }',
+    inputSchema: {
+      type: "object",
+      properties: {
+        raceName: {
+          type: "string",
+          description: "Name for the new race (REQUIRED). Must be unique.",
+        },
+        sourceRaceName: {
+          type: "string",
+          description:
+            "Name of an existing race to duplicate from (Global Library lookup). If provided, enters duplicate mode.",
+        },
+        sourceRacePath: {
+          type: "string",
+          description:
+            "Direct asset path to the source RaceData. Alternative to sourceRaceName.",
+        },
+        outputFolder: {
+          type: "string",
+          description:
+            "Folder to save the new RaceData (and base recipe). Defaults to same folder as source race in duplicate mode.",
+        },
+        wardrobeSlots: {
+          type: "array",
+          description: "Wardrobe slot list. In duplicate mode, overrides the source's list.",
+          items: { type: "string" },
+        },
+        umaTarget: {
+          type: "string",
+          description: "'Humanoid' (default) or 'Generic'.",
+          enum: ["Humanoid", "Generic"],
+        },
+        fixupRotations: {
+          type: "boolean",
+          description: "Set to true for Blender FBX slots (default: copies source or true).",
+        },
+        tags: {
+          type: "array",
+          description: "Tags for the new race.",
+          items: { type: "string" },
+        },
+        fbxPath: {
+          type: "string",
+          description:
+            "Asset path to a body FBX file (e.g. 'Assets/.../SK_Hu_F_FullBody.fbx'). " +
+            "Enables FBX mode: creates body slots, overlays, and base race recipe from the FBX.",
+        },
+        umaMaterialPath: {
+          type: "string",
+          description:
+            "FULL asset path to the UMAMaterial for body slots (required in FBX mode). " +
+            "Must start with 'Assets/' and end with '.asset'.",
+        },
+        backwardsCompatibleWith: {
+          type: "array",
+          description: "Cross-compatible race names.",
+          items: { type: "string" },
+        },
+        raceHeight: { type: "number", description: "Default height (default: 2.0)." },
+        raceRadius: { type: "number", description: "Default radius (default: 0.25)." },
+        raceMass: { type: "number", description: "Default mass (default: 50)." },
+        duplicateBaseRecipe: {
+          type: "boolean",
+          description:
+            "In duplicate mode, also duplicate the base recipe with updated race name (default: true).",
+        },
+        registerInLibrary: {
+          type: "boolean",
+          description: "Register the new race in the UMA Global Library (default: true).",
+        },
+      },
+      required: ["raceName"],
+    },
+    handler: async (params) =>
+      JSON.stringify(await bridge.umaCreateRace(params), null, 2),
+  },
 ];

@@ -2,7 +2,7 @@
 
 All notable changes to this package will be documented in this file.
 
-## [2.26.0] - 2026-03-16
+## [2.27.0] - 2026-03-25
 
 ### Added
 - **UMA (Unity Multipurpose Avatar) integration** — 13 new tools for the complete UMA asset pipeline:
@@ -20,6 +20,13 @@ All notable changes to this package will be documented in this file.
   - `uma/rebuild-global-library` — Force rebuild the Global Library index
   - `uma/register-assets` — Register Slot/Overlay/Recipe assets in the Global Library
 - New `uma-bridge.js` module — UMA bridge functions extracted into a dedicated module
+- New `uma-tools.js` — Full tool definitions and schemas for all UMA tools
+
+## [2.26.0] - 2026-03-25
+
+### Added
+- **Compilation error detection** — New `unity_get_compilation_errors` tool retrieves C# compilation errors and warnings via `CompilationPipeline` API, independent of console log buffer
+- **Test Runner integration** — Run EditMode/PlayMode tests, poll results, list available tests via Unity Test Runner API
 
 ## [2.25.0] - 2026-03-09
 

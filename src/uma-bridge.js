@@ -53,3 +53,11 @@ export async function umaCreateWardrobeFromFbx(params) {
 export async function umaWardrobeEquip(params) {
   return sendCommand("uma/wardrobe-equip", params);
 }
+
+export async function umaEditRace(params) {
+  return sendCommand("uma/edit-race", params);
+}
+
+export async function umaCreateRace(params) {
+  return sendCommand("uma/create-race", params);
+}
