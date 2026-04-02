@@ -2,6 +2,11 @@
 
 All notable changes to this package will be documented in this file.
 
+## [2.28.1] - 2026-04-02
+
+### Fixed
+- **npm publish workflow** — Added `--allow-same-version` to `npm version` command to prevent CI failure when `package.json` already matches the release tag
+
 ## [2.28.0] - 2026-04-02
 
 ### Added
