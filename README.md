@@ -2,9 +2,9 @@
   <img src="icon.png" alt="AnkleBreaker MCP" width="180" />
 </p>
 
-# Unity MCP Server — AI-Powered Unity Editor & Hub Control
+# Unity MCP Server AI-Powered Unity Editor & Hub Control
 
-> **The most comprehensive [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for Unity game development.** Connect Claude, Cursor, Windsurf, or any MCP-compatible AI assistant to **Unity Editor** and **Unity Hub** with **281 tools** across **30+ categories**. Built and maintained by [AnkleBreaker Studio](https://github.com/AnkleBreaker-Studio).
+> **The most comprehensive [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for Unity game development.** Connect Claude, Cursor, Windsurf, or any MCP-compatible AI assistant to **Unity Editor** and **Unity Hub** with **288 tools** across **30+ categories**. Built and maintained by [AnkleBreaker Studio](https://github.com/AnkleBreaker-Studio).
 
 **AnkleBreaker Unity MCP** turns your AI assistant into a full Unity co-pilot — create scenes, manipulate GameObjects, manage components, run builds, profile performance, edit Shader Graphs, control Amplify Shader Editor, sculpt terrain, bake NavMesh, manage animations, run multiplayer playmode scenarios, and much more — all without leaving your AI chat. Works with Claude Desktop, Claude Cowork, Cursor, Windsurf, and any tool that supports the Model Context Protocol.
 
@@ -12,7 +12,7 @@
 > Claude creates the entire game: scene setup, neon materials with bloom post-processing, brick grid layout, game scripts, VFX, and UI — all through Unity MCP commands.
 
 <p align="center">
-  <img src="docs/unity-mcp-showcase-brickbreaker.gif" alt="Unity MCP — AI building a neon brick breaker game in Unity Editor" width="800" />
+  <img src="docs/unity-mcp-showcase-brickbreaker.gif" alt="Unity MCP AI building a neon brick breaker game in Unity Editor" width="800" />
 </p>
 
 ### 3D Medieval Village — AI-generated terrain, houses, and environment
@@ -38,7 +38,7 @@
 
 ## Features
 
-**281 tools** covering the full Unity workflow:
+**288 tools** covering the full Unity workflow:
 
 | Category | Tools |
 |----------|-------|
@@ -79,6 +79,7 @@
 | **MPPM Scenarios** | List, activate, start, stop multiplayer playmode scenarios; get status & player info |
 | **Multi-Instance** | Discover and switch between multiple running Unity Editor instances |
 | **Multi-Agent** | List active agents, get agent action logs, queue monitoring |
+| **SpriteAtlas** | Create, inspect, add/remove sprites, configure settings, delete, list SpriteAtlases |
 | **UMA (Unity Multipurpose Avatar)** | Create slots, overlays, wardrobe recipes from FBX; equip/unequip items on DCA; browse/rebuild Global Library |
 | **Project Context** | Auto-inject project-specific docs and guidelines for AI agents |
 
@@ -94,7 +95,7 @@ This server communicates with:
 - **Unity Hub** via its CLI (supports both modern `--headless` and legacy `-- --headless` syntax)
 - **Unity Editor** via the companion [unity-mcp-plugin](https://github.com/AnkleBreaker-Studio/unity-mcp-plugin) which runs an HTTP API inside the editor
 
-### 268 Tools Across 30+ Categories
+### 288 Tools Across 30+ Categories
 > Scene management, GameObjects, components, physics, terrain, Shader Graph, Amplify Shader Editor, profiling, animation, NavMesh, builds, multiplayer, and more.
 
 <p align="center">
@@ -103,7 +104,7 @@ This server communicates with:
 
 ### Two-Tier Tool System
 
-To avoid overwhelming MCP clients with 281 tools, the server uses a two-tier architecture:
+To avoid overwhelming MCP clients with 288 tools, the server uses a two-tier architecture:
 - **Core tools** (~70) are always exposed directly
 - **Advanced tools** (~130+) are accessed via a single `unity_advanced_tool` proxy with lazy loading
 
@@ -227,7 +228,7 @@ AnkleBreaker Unity MCP is the most comprehensive MCP integration for Unity, purp
 
 | Feature | **AnkleBreaker MCP** | **Bezi** | **Coplay MCP** | **Unity AI** |
 |---------|:-------------------:|:--------:|:--------------:|:------------:|
-| **Total Tools** | **281** | ~30 | 34 | Limited (built-in) |
+| **Total Tools** | **288** | ~30 | 34 | Limited (built-in) |
 | **Feature Categories** | **30+** | ~5 | ~5 | N/A |
 | **Non-Blocking Editor** | ✅ Full background operation | ❌ Freezes Unity during tasks | ✅ | ✅ |
 | **Open Source** | ✅ AnkleBreaker Open License | ❌ Proprietary | ✅ MIT License | ❌ Proprietary |
@@ -255,7 +256,7 @@ AnkleBreaker Unity MCP is the most comprehensive MCP integration for Unity, purp
 
 | Solution | Monthly Cost | What You Get |
 |----------|:----------:|--------------| 
-| **AnkleBreaker MCP (free) + Claude Pro** | **$20/mo** | 281 tools, full Unity control, open source — MCP is free, price is Claude only |
+| **AnkleBreaker MCP (free) + Claude Pro** | **$20/mo** | 288 tools, full Unity control, open source — MCP is free, price is Claude only |
 | **AnkleBreaker MCP (free) + Claude Max 5x** | **$100/mo** | Same + 5x usage for heavy workflows — MCP is free, price is Claude only |
 | **AnkleBreaker MCP (free) + Claude Max 20x** | **$200/mo** | Same + 20x usage for teams/studios — MCP is free, price is Claude only |
 | **Bezi Pro** | $20/mo | ~30 tools, 800 credits/mo, freezes Unity |
@@ -270,7 +271,7 @@ AnkleBreaker Unity MCP is the most comprehensive MCP integration for Unity, purp
 Bezi runs as a proprietary Unity plugin with its own credit-based billing — $20–$200/mo on top of your AI subscription. It has historically suffered from freezing the Unity Editor during AI tasks, blocking your workflow. AnkleBreaker MCP is completely free and open source, runs entirely in the background with zero editor impact, and offers 8x more tools — the only cost is your existing Claude subscription.
 
 **vs. Coplay MCP:**
-Coplay MCP provides 34 tools across ~5 categories. AnkleBreaker MCP delivers 281 tools across 30+ categories including advanced features like physics raycasts, terrain editing, shader graph management, profiling, NavMesh, particle systems, and MPPM multiplayer — none of which exist in Coplay. Our two-tier lazy loading system is specifically optimized for Claude Cowork's tool limits.
+Coplay MCP provides 34 tools across ~5 categories. AnkleBreaker MCP delivers 288 tools across 30+ categories including advanced features like physics raycasts, terrain editing, shader graph management, profiling, NavMesh, particle systems, and MPPM multiplayer — none of which exist in Coplay. Our two-tier lazy loading system is specifically optimized for Claude Cowork's tool limits.
 
 **vs. Unity AI:**
 Unity AI (successor to Muse) is built into Unity 6.2+ but limited to Unity's own AI models and a credit-based "Unity Points" system. It cannot be used with Claude or any external AI assistant, has no MCP support, and offers a fraction of the automation capabilities. AnkleBreaker MCP works with any MCP-compatible AI while giving you full control over which AI models you use.
@@ -288,9 +289,21 @@ If Unity MCP helps your workflow, consider supporting its development! Your supp
 
 **Sponsor tiers include priority feature requests** — your ideas get bumped up the roadmap! Check out the tiers on [GitHub Sponsors](https://github.com/sponsors/AnkleBreaker-Studio) or [Patreon](https://www.patreon.com/AnkleBreakerStudio).
 
+## What's New in v2.28.2
+
+- **Codex CLI compatibility** — Two diagnostic `console.debug(...)` calls in the bridge were writing to stdout, corrupting the MCP JSON-RPC framing. Strict clients like Codex CLI closed the transport as soon as they hit the non-JSON line; the bug was invisible on Claude Desktop / Claude Code which tolerate the framing violation. Both call sites now log to stderr.
+
+## What's New in v2.28.0
+
+- **npm auto-publish** — A GitHub Action now automatically publishes to npm whenever a new GitHub release is created. Contributed by [@vatanaksoytezer](https://github.com/vatanaksoytezer) in [#8](https://github.com/AnkleBreaker-Studio/unity-mcp-server/pull/8).
+- **npm package renamed** — Package renamed from `unity-mcp-server` to `anklebreaker-unity-mcp` to avoid name conflict on npm. Install via `npx anklebreaker-unity-mcp@latest`.
+- **SpriteAtlas tools** — 7 new tools for Unity SpriteAtlas management: create, inspect, add/remove sprites, configure packing & texture settings, delete, and list SpriteAtlases. Contributed by [@zaferdace](https://github.com/zaferdace). Registered as advanced tools accessible via `unity_advanced_tool`.
+- **UTF-8 encoding fix** — Fixed corrupted characters in `unity-editor-bridge.js` comments and section headers.
+
 ## What's New in v2.27.0
 
-- **UMA (Unity Multipurpose Avatar) integration** â€” 13 new tools for the complete UMA asset pipeline. Create SlotDataAssets, OverlayDataAssets, and WardrobeRecipes directly from FBX files, equip/unequip wardrobe items on DynamicCharacterAvatar, browse and manage the UMA Global Library, verify recipes for missing references, and more. Requires UMA 2 (available on the Asset Store). Registered as advanced tools accessible via `unity_advanced_tool`.
+- **UMA (Unity Multipurpose Avatar) integration** — 13 new tools for the complete UMA asset pipeline. Create SlotDataAssets, OverlayDataAssets, and WardrobeRecipes directly from FBX files, equip/unequip wardrobe items on DynamicCharacterAvatar, browse and manage the UMA Global Library, verify recipes for missing references, and more. Requires UMA 2 (available on the Asset Store). Registered as advanced tools accessible via `unity_advanced_tool`.
+
 ## What's New in v2.26.0
 
 - **Compilation error detection** — New `unity_get_compilation_errors` tool retrieves C# compilation errors and warnings directly from Unity's `CompilationPipeline` API. Unlike `unity_console_log`, this is independent of the console log buffer — not affected by console clear, Play Mode log flooding, or buffer overflow. Supports filtering by severity (`error`, `warning`, `all`) and count limit. Registered as a core tool (always directly accessible, not behind `unity_advanced_tool`).
@@ -308,7 +321,7 @@ If Unity MCP helps your workflow, consider supporting its development! Your supp
 Unity MCP (Model Context Protocol) is an open-source integration that connects AI assistants like Claude, Cursor, and Windsurf to the Unity Editor and Unity Hub. It allows AI to directly control Unity — creating scenes, placing objects, writing scripts, running builds, profiling, and more — through a standardized protocol.
 
 **How does AnkleBreaker Unity MCP compare to other Unity AI tools?**
-AnkleBreaker Unity MCP offers 281 tools across 30+ categories, making it the most comprehensive Unity MCP integration available. Competitors like Bezi (~30 tools) and Coplay MCP (34 tools) cover a fraction of Unity's features. Unlike Bezi, AnkleBreaker MCP is free, open source, and doesn't freeze the Unity Editor during AI operations.
+AnkleBreaker Unity MCP offers 288 tools across 30+ categories, making it the most comprehensive Unity MCP integration available. Competitors like Bezi (~30 tools) and Coplay MCP (34 tools) cover a fraction of Unity's features. Unlike Bezi, AnkleBreaker MCP is free, open source, and doesn't freeze the Unity Editor during AI operations.
 
 **Does it work with Claude Desktop / Claude Cowork?**
 Yes. AnkleBreaker Unity MCP is purpose-built for Claude Desktop and Claude Cowork. It uses a two-tier lazy loading system to stay within MCP client tool limits while exposing all 281 tools on demand.

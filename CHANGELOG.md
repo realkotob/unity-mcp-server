@@ -2,6 +2,39 @@
 
 All notable changes to this package will be documented in this file.
 
+## [2.28.2] - 2026-04-22
+
+### Fixed
+- **MCP JSON-RPC framing corrupted by debug logs on stdout** — Two `console.debug(...)` call sites in `src/unity-editor-bridge.js` and `src/tool-tiers.js` wrote diagnostic lines to stdout, which the MCP stdio transport reserves exclusively for JSON-RPC messages. Strict clients (Codex CLI) closed the transport on the first non-JSON chunk; lenient clients (Claude Desktop, Claude Code) tolerated it, which is why the bug escaped earlier detection. Both call sites now use `console.error(...)` so logs go to stderr. Fixes [#11](https://github.com/AnkleBreaker-Studio/unity-mcp-server/issues/11).
+
+## [2.28.1] - 2026-04-02
+
+### Fixed
+- **npm publish workflow** — Added `--allow-same-version` to `npm version` command to prevent CI failure when `package.json` already matches the release tag
+
+## [2.28.0] - 2026-04-02
+
+### Added
+- **SpriteAtlas tools** — 7 new tools for Unity SpriteAtlas management (contributed by [@zaferdace](https://github.com/zaferdace)):
+  - `spriteatlas/create` — Create a new SpriteAtlas asset
+  - `spriteatlas/info` — Get SpriteAtlas details (packed sprites, settings)
+  - `spriteatlas/add` — Add sprites/folders to a SpriteAtlas
+  - `spriteatlas/remove` — Remove entries from a SpriteAtlas
+  - `spriteatlas/settings` — Configure packing, texture, and platform settings
+  - `spriteatlas/delete` — Delete a SpriteAtlas asset
+  - `spriteatlas/list` — List all SpriteAtlases in the project
+- New `spriteatlas-bridge.js` and `spriteatlas-tools.js` modules
+
+### Added
+- **npm auto-publish** — GitHub Action that automatically publishes to npm whenever a new GitHub release is created (contributed by [@vatanaksoytezer](https://github.com/vatanaksoytezer) in [#8](https://github.com/AnkleBreaker-Studio/unity-mcp-server/pull/8))
+
+### Changed
+- **npm package renamed** — Package renamed from `unity-mcp-server` to `anklebreaker-unity-mcp` to avoid name conflict on npm. Install via `npx anklebreaker-unity-mcp@latest`
+
+### Fixed
+- **UTF-8 encoding** — Fixed mojibake characters (corrupted em-dashes, arrows, section headers) across all comments in `unity-editor-bridge.js`; removed stale BOM
+- **package-lock.json** — Synced version field to 2.27.0
+
 ## [2.27.0] - 2026-03-25
 
 ### Added
