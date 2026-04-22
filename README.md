@@ -289,6 +289,10 @@ If Unity MCP helps your workflow, consider supporting its development! Your supp
 
 **Sponsor tiers include priority feature requests** — your ideas get bumped up the roadmap! Check out the tiers on [GitHub Sponsors](https://github.com/sponsors/AnkleBreaker-Studio) or [Patreon](https://www.patreon.com/AnkleBreakerStudio).
 
+## What's New in v2.28.2
+
+- **Codex CLI compatibility** — Two diagnostic `console.debug(...)` calls in the bridge were writing to stdout, corrupting the MCP JSON-RPC framing. Strict clients like Codex CLI closed the transport as soon as they hit the non-JSON line; the bug was invisible on Claude Desktop / Claude Code which tolerate the framing violation. Both call sites now log to stderr.
+
 ## What's New in v2.28.0
 
 - **npm auto-publish** — A GitHub Action now automatically publishes to npm whenever a new GitHub release is created. Contributed by [@vatanaksoytezer](https://github.com/vatanaksoytezer) in [#8](https://github.com/AnkleBreaker-Studio/unity-mcp-server/pull/8).
