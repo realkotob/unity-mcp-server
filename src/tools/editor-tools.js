@@ -1,5 +1,64 @@
 ﻿// AnkleBreaker Unity MCP â€” Tool definitions for Unity Editor operations (via HTTP bridge)
 import * as bridge from "../unity-editor-bridge.js";
+import { formatResult, looksLikeErrorObject } from "../response-format.js";
+import { isUnknownRouteResult } from "../capabilities.js";
+
+// Shared shaping for image-returning graphics tools.
+// The bridge wraps plugin payloads as { success, data: { ..., base64 } } (queue mode)
+// but legacy mode and some code paths surface { ..., base64 } at the top level, so the
+// image is looked up at both depths. The base64 payload must NEVER remain inside the
+// metadata text block: a single leaked PNG is a multi-hundred-KB token bomb.
+function imageResultBlocks(result, noImageError) {
+  if (result.error) return formatResult(result);
+  const imageData = result.data?.base64 || result.base64;
+  if (!imageData || typeof imageData !== "string") {
+    // noImageError last so an empty-string result.error can't clobber the message.
+    return formatResult({ ...result, error: noImageError });
+  }
+  const metadata = { ...result };
+  delete metadata.base64;
+  if (metadata.data && typeof metadata.data === "object") {
+    metadata.data = { ...metadata.data };
+    delete metadata.data.base64;
+  }
+  const b64 = imageData.replace(/^data:image\/\w+;base64,/, "");
+  return [
+    { type: "image", data: b64, mimeType: "image/png" },
+    { type: "text", text: formatResult(metadata) },
+  ];
+}
+
+// Console entries ship a full multi-frame stack trace on EVERY entry — measured at
+// ~80% of a typical console payload, almost all of it noise for plain info logs.
+// Server-side stripping works against every plugin version. Policy: "errors" (default)
+// keeps a trimmed trace on error-like entries only; "all"/"none" override; frame cap
+// applies wherever a trace is kept. The plugin data is untouched — full traces remain
+// one explicit parameter away, so no capability is lost.
+const ERROR_LIKE_LOG_TYPES = new Set(["error", "exception", "assert"]);
+
+function shapeConsoleLogResult(result, includeStackTrace, maxStackFrames) {
+  const mode = includeStackTrace === "all" || includeStackTrace === "none" ? includeStackTrace : "errors";
+  const frameCap = Number.isInteger(maxStackFrames) && maxStackFrames > 0 ? maxStackFrames : 6;
+  const entries = result?.data?.entries;
+  if (!Array.isArray(entries)) return result;
+
+  const shaped = entries.map((entry) => {
+    if (!entry || typeof entry.stackTrace !== "string" || entry.stackTrace.length === 0) return entry;
+    const keep = mode === "all" || (mode === "errors" && ERROR_LIKE_LOG_TYPES.has(String(entry.type).toLowerCase()));
+    if (!keep) {
+      const { stackTrace, ...rest } = entry;
+      return rest;
+    }
+    const frames = entry.stackTrace.split("\n").filter((line) => line.trim().length > 0);
+    if (frames.length <= frameCap) return entry;
+    return {
+      ...entry,
+      stackTrace: `${frames.slice(0, frameCap).join("\n")}\n... (+${frames.length - frameCap} more frames; use includeStackTrace:"all" + maxStackFrames for the full trace)`,
+    };
+  });
+
+  return { ...result, data: { ...result.data, entries: shaped } };
+}
 
 export const editorTools = [
   // â”€â”€â”€ Connection â”€â”€â”€
@@ -7,13 +66,13 @@ export const editorTools = [
     name: "unity_editor_ping",
     description: "Check if the Unity Editor bridge is running and responsive. Returns editor version, project name, and connection status.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.ping(), null, 2),
+    handler: async () => formatResult(await bridge.ping()),
   },
   {
     name: "unity_editor_state",
     description: "Get the current Unity Editor state: play mode, compilation status, active scene, project path.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.getEditorState(), null, 2),
+    handler: async () => formatResult(await bridge.getEditorState()),
   },
 
   // â”€â”€â”€ Scene Management â”€â”€â”€
@@ -21,44 +80,66 @@ export const editorTools = [
     name: "unity_scene_info",
     description: "Get information about the currently open scene(s), including name, path, dirty state, and root game objects.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.getSceneInfo(), null, 2),
+    handler: async () => formatResult(await bridge.getSceneInfo()),
   },
   {
     name: "unity_scene_open",
-    description: "Open a scene by its asset path (relative to Assets/).",
+    description:
+      "Open a scene by its asset path (relative to Assets/). Refuses if any loaded scene has " +
+      "unsaved changes — pass saveFirst or discardUnsavedChanges.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Scene asset path, e.g. 'Assets/Scenes/MainScene.unity'" },
+        saveFirst: { type: "boolean", description: "Save all modified scenes before switching." },
+        discardUnsavedChanges: { type: "boolean", description: "Proceed and LOSE unsaved changes." },
       },
       required: ["path"],
     },
-    handler: async ({ path }) => JSON.stringify(await bridge.openScene(path), null, 2),
+    handler: async (params) => formatResult(await bridge.openScene(params)),
   },
   {
     name: "unity_scene_save",
-    description: "Save the current scene.",
-    inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.saveScene(), null, 2),
+    description:
+      "Save the current scene. A never-saved scene requires `path` (saving without one would " +
+      "open Unity's interactive Save dialog).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path to save to, e.g. 'Assets/Scenes/MyScene.unity'. Required for a scene that has never been saved; also acts as Save-As." },
+      },
+    },
+    handler: async (params) => formatResult(await bridge.saveScene(params)),
   },
   {
     name: "unity_scene_new",
-    description: "Create a new empty scene.",
-    inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.newScene(), null, 2),
+    description:
+      "Create a new empty scene (REPLACES the current one). Refuses if any loaded scene has " +
+      "unsaved changes — pass saveFirst or discardUnsavedChanges.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        saveFirst: { type: "boolean", description: "Save all modified scenes first." },
+        discardUnsavedChanges: { type: "boolean", description: "Proceed and LOSE unsaved changes." },
+      },
+    },
+    handler: async (params) => formatResult(await bridge.newScene(params)),
   },
   {
     name: "unity_scene_hierarchy",
-    description: "Get the full hierarchy tree of all GameObjects in the active scene, including their components and children.",
+    description:
+      "Get the hierarchy tree of all GameObjects in the active scene, including their components and children. " +
+      "Dense by default: per-node fields at their default value (active=true, tag=Untagged, layer=Default, origin position, Transform) are omitted — an absent field means the default.",
     inputSchema: {
       type: "object",
       properties: {
         maxDepth: { type: "number", description: "Maximum depth to traverse (default: 10)" },
         maxNodes: { type: "number", description: "Maximum total nodes to return (default: 5000). Use lower values for very large scenes to avoid timeouts." },
         parentPath: { type: "string", description: "Only return hierarchy under this GameObject path (e.g. 'Canvas/Panel'). Useful for exploring specific subtrees in large scenes." },
+        verbose: { type: "boolean", description: "Emit every per-node field even at default values (the pre-2.37 shape)." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getHierarchy(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getHierarchy(params)),
   },
 
   // â”€â”€â”€ GameObject Operations â”€â”€â”€
@@ -90,19 +171,22 @@ export const editorTools = [
       },
       required: ["name"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createGameObject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createGameObject(params)),
   },
   {
     name: "unity_gameobject_delete",
-    description: "Delete a GameObject from the scene by path or name.",
+    description:
+      "Delete a GameObject by path or name. Refuses if its runtime mesh is shared by other " +
+      "objects (ProBuilder clones) — reports sharedWith; pass force:true to override.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name of the GameObject to delete" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
+        force: { type: "boolean", description: "Delete even when the runtime mesh is shared by other objects (ProBuilder clones). Default false." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.deleteGameObject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.deleteGameObject(params)),
   },
   {
     name: "unity_gameobject_info",
@@ -111,10 +195,10 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getGameObjectInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getGameObjectInfo(params)),
   },
   {
     name: "unity_gameobject_set_transform",
@@ -123,14 +207,14 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name" },
-        instanceId: { type: "number", description: "Instance ID (alternative)" },
+        instanceId: { type: "string", description: "Instance ID (alternative)" },
         position: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
         rotation: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
         scale: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
         local: { type: "boolean", description: "If true, set local transform instead of world (default: false)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setTransform(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTransform(params)),
   },
 
   // â”€â”€â”€ Component Operations â”€â”€â”€
@@ -145,7 +229,7 @@ export const editorTools = [
       },
       required: ["gameObjectPath", "componentType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addComponent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addComponent(params)),
   },
   {
     name: "unity_component_remove",
@@ -159,7 +243,7 @@ export const editorTools = [
       },
       required: ["gameObjectPath", "componentType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeComponent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeComponent(params)),
   },
   {
     name: "unity_component_get_properties",
@@ -172,7 +256,7 @@ export const editorTools = [
       },
       required: ["gameObjectPath", "componentType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getComponentProperties(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getComponentProperties(params)),
   },
   {
     name: "unity_component_set_property",
@@ -183,7 +267,7 @@ export const editorTools = [
         gameObjectPath: { type: "string", description: "Path or name of target GameObject" },
         componentType: { type: "string", description: "Component type name" },
         propertyName: { type: "string", description: "Name of the property to set" },
-        value: { description: "Value to set (type depends on property). For ObjectReference: string asset path, string scene object name, null, or {assetPath?, instanceId?, gameObject?, componentType?}" },
+        value: { type: ["string", "number", "boolean", "object", "array", "null"], description: "Value to set. ObjectReference accepts: asset path, scene object name, null, or {assetPath?, instanceId?, gameObject?, componentType?}" },
       },
       required: ["gameObjectPath", "componentType", "propertyName", "value"],
     },
@@ -204,32 +288,32 @@ export const editorTools = [
           params.value = false;
         }
       }
-      return JSON.stringify(await bridge.setComponentProperty(params), null, 2);
+      return formatResult(await bridge.setComponentProperty(params));
     },
   },
   {
     name: "unity_component_set_reference",
-    description: "Set an object reference on a component property. Dedicated tool for wiring references between GameObjects, components, and assets. More powerful than set_property for ObjectReference fields â€” supports resolution by asset path, scene GameObject name, component type, or instance ID.",
+    description: "Wire an object reference on a component property. Resolves by asset path, scene GameObject name, component type, or instance ID (richer than set_property for ObjectReference fields).",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name of the target GameObject" },
-        instanceId: { type: "number", description: "Instance ID of the target GameObject (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID of the target GameObject (alternative to path)" },
         componentType: { type: "string", description: "Component type containing the property (optional â€” will auto-search all components)" },
         propertyName: { type: "string", description: "Name of the ObjectReference property to set" },
         assetPath: { type: "string", description: "Asset path to assign (e.g. 'Assets/Materials/MyMat.mat', 'Assets/Prefabs/Enemy.prefab')" },
         referenceGameObject: { type: "string", description: "Name or hierarchy path of a scene GameObject to assign" },
         referenceComponentType: { type: "string", description: "When referencing a scene object, get a specific component instead of the GameObject itself (e.g. 'Camera', 'AudioSource')" },
-        referenceInstanceId: { type: "number", description: "Instance ID of the object to assign" },
+        referenceInstanceId: { type: "string", description: "Instance ID of the object to assign (64-bit-safe string)" },
         clear: { type: "boolean", description: "Set to true to clear/null the reference" },
       },
       required: ["propertyName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setComponentReference(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setComponentReference(params)),
   },
   {
     name: "unity_component_batch_wire",
-    description: "Wire multiple object references in a single call. Efficient for setting up many references at once (e.g. wiring a UI manager to all its panels, connecting enemy AI to patrol waypoints). Each entry specifies a target GameObject, property, and reference to assign.",
+    description: "Wire multiple object references in one call (e.g. a manager to all its panels). Each entry: target GameObject, property, reference to assign.",
     inputSchema: {
       type: "object",
       properties: {
@@ -240,13 +324,13 @@ export const editorTools = [
             type: "object",
             properties: {
               path: { type: "string", description: "Target GameObject path or name" },
-              instanceId: { type: "number", description: "Target GameObject instance ID" },
+              instanceId: { type: "string", description: "Target GameObject instance ID" },
               componentType: { type: "string", description: "Component type (optional)" },
               propertyName: { type: "string", description: "Property name to set" },
               assetPath: { type: "string", description: "Asset path to assign" },
               referenceGameObject: { type: "string", description: "Scene GameObject to assign" },
               referenceComponentType: { type: "string", description: "Component type on the referenced GameObject" },
-              referenceInstanceId: { type: "number", description: "Instance ID to assign" },
+              referenceInstanceId: { type: "string", description: "Instance ID to assign (64-bit-safe string)" },
               clear: { type: "boolean", description: "Clear the reference" },
             },
             required: ["propertyName"],
@@ -255,7 +339,34 @@ export const editorTools = [
       },
       required: ["references"],
     },
-    handler: async (params) => JSON.stringify(await bridge.batchWireReferences(params), null, 2),
+    handler: async (params) => {
+      const result = await bridge.batchWireReferences(params);
+      // Graceful degrade for plugins that predate component/batch-wire: run the
+      // entries as single set-reference calls instead of failing the whole batch.
+      if (isUnknownRouteResult(result)) {
+        console.error("[MCP] Plugin lacks component/batch-wire - degrading to single set-reference calls");
+        // Pipeline the round-trips instead of awaiting each in turn — the plugin queue still
+        // serializes the actual writes, but this bounds wall-clock by the slowest single call
+        // rather than their sum (the batch tool's whole point is many refs at once). Promise.all
+        // preserves order, so results[i] still matches references[i].
+        const results = await Promise.all(
+          (params.references || []).map((entry) => bridge.setComponentReference(entry))
+        );
+        // Old plugins report per-call failures as an HTTP 200 { success:true, data:{error} }
+        // envelope, so a plain success!==false check would mask every degraded failure —
+        // the exact misleading-success class this project set out to kill. Inspect the
+        // inner payload too.
+        const isOk = (r) => r && r.success !== false && !looksLikeErrorObject(r.data);
+        const allOk = results.every(isOk);
+        return formatResult({
+          success: allOk,
+          degraded: "batch-wire unavailable on this plugin version; executed as single set-reference calls",
+          failedCount: results.filter((r) => !isOk(r)).length,
+          results,
+        });
+      }
+      return formatResult(result);
+    },
   },
   {
     name: "unity_component_get_referenceable",
@@ -264,14 +375,14 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Target GameObject path or name" },
-        instanceId: { type: "number", description: "Target GameObject instance ID" },
+        instanceId: { type: "string", description: "Target GameObject instance ID" },
         componentType: { type: "string", description: "Component type containing the property" },
         propertyName: { type: "string", description: "ObjectReference property name to inspect" },
         maxResults: { type: "number", description: "Maximum results to return (default: 50)" },
       },
       required: ["propertyName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getReferenceableObjects(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getReferenceableObjects(params)),
   },
 
   // â”€â”€â”€ Asset Management â”€â”€â”€
@@ -288,7 +399,7 @@ export const editorTools = [
         maxResults: { type: "number", description: "Maximum assets to return (default: 500). Use lower values for large projects." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getAssetList(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAssetList(params)),
   },
   {
     name: "unity_asset_import",
@@ -298,22 +409,27 @@ export const editorTools = [
       properties: {
         sourcePath: { type: "string", description: "Absolute path to the source file on disk" },
         destinationPath: { type: "string", description: "Destination path inside Assets/ folder" },
+        overwrite: { type: "boolean", description: "Replace an existing asset at the destination (default false)." },
       },
       required: ["sourcePath", "destinationPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.importAsset(params), null, 2),
+    handler: async (params) => formatResult(await bridge.importAsset(params)),
   },
   {
     name: "unity_asset_delete",
-    description: "Delete an asset from the project.",
+    description:
+      "Delete an asset — to the OS trash by default (NOT undoable via unity_undo_last). " +
+      "Deleting a FOLDER is recursive and refuses without recursive:true.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Asset path relative to project root (e.g. 'Assets/Scripts/MyScript.cs')" },
+        recursive: { type: "boolean", description: "Required to delete a FOLDER and its contents. Default false refuses, reporting the asset count." },
+        permanent: { type: "boolean", description: "Hard-delete instead of OS trash. Default false." },
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.deleteAsset(params), null, 2),
+    handler: async (params) => formatResult(await bridge.deleteAsset(params)),
   },
   {
     name: "unity_asset_create_prefab",
@@ -326,7 +442,7 @@ export const editorTools = [
       },
       required: ["gameObjectPath", "savePath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createPrefab(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createPrefab(params)),
   },
   {
     name: "unity_asset_instantiate_prefab",
@@ -342,7 +458,7 @@ export const editorTools = [
       },
       required: ["prefabPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.instantiatePrefab(params), null, 2),
+    handler: async (params) => formatResult(await bridge.instantiatePrefab(params)),
   },
 
   // â”€â”€â”€ Script / Code Operations â”€â”€â”€
@@ -355,10 +471,11 @@ export const editorTools = [
         path: { type: "string", description: "Asset path for the script (e.g. 'Assets/Scripts/PlayerController.cs')" },
         content: { type: "string", description: "Full C# source code content" },
         className: { type: "string", description: "Class name (defaults to filename without extension)" },
+        overwrite: { type: "boolean", description: "Replace an existing script (default false). Use unity_script_update to edit." },
       },
       required: ["path", "content"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createScript(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createScript(params)),
   },
   {
     name: "unity_script_read",
@@ -370,7 +487,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.readScript(params), null, 2),
+    handler: async (params) => formatResult(await bridge.readScript(params)),
   },
   {
     name: "unity_script_update",
@@ -383,7 +500,7 @@ export const editorTools = [
       },
       required: ["path", "content"],
     },
-    handler: async (params) => JSON.stringify(await bridge.updateScript(params), null, 2),
+    handler: async (params) => formatResult(await bridge.updateScript(params)),
   },
   {
     name: "unity_execute_code",
@@ -395,7 +512,7 @@ export const editorTools = [
       },
       required: ["code"],
     },
-    handler: async ({ code }) => JSON.stringify(await bridge.executeCode(code), null, 2),
+    handler: async ({ code }) => formatResult(await bridge.executeCode(code)),
   },
 
   // â”€â”€â”€ Material / Rendering â”€â”€â”€
@@ -409,10 +526,11 @@ export const editorTools = [
         shader: { type: "string", description: "Shader name (e.g. 'Standard', 'Universal Render Pipeline/Lit')" },
         color: { type: "object", properties: { r: { type: "number" }, g: { type: "number" }, b: { type: "number" }, a: { type: "number" } } },
         properties: { type: "object", description: "Additional shader properties as key-value pairs" },
+        overwrite: { type: "boolean", description: "Replace an existing material (default false)." },
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createMaterial(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createMaterial(params)),
   },
   {
     name: "unity_renderer_set_material",
@@ -426,7 +544,7 @@ export const editorTools = [
       },
       required: ["gameObjectPath", "materialPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setMaterial(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setMaterial(params)),
   },
 
   // â”€â”€â”€ Build â”€â”€â”€
@@ -451,27 +569,37 @@ export const editorTools = [
       },
       required: ["target", "outputPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.buildProject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.buildProject(params)),
   },
 
   // â”€â”€â”€ Console / Logging â”€â”€â”€
   {
     name: "unity_console_log",
-    description: "Get recent Unity console log messages (errors, warnings, info). Useful for debugging.",
+    description: "Get recent Unity console log messages (errors, warnings, info).",
     inputSchema: {
       type: "object",
       properties: {
         count: { type: "number", description: "Number of recent messages to retrieve (default: 50)" },
         type: { type: "string", description: "Filter: 'error', 'warning', 'info', or 'all' (default: 'all')" },
+        includeStackTrace: {
+          type: "string",
+          enum: ["errors", "all", "none"],
+          description: "Traces to keep: 'errors' (default, error-like entries only, trimmed), 'all', 'none'.",
+        },
+        maxStackFrames: { type: "number", description: "Frames kept per retained trace (default: 6)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getConsoleLog(params), null, 2),
+    handler: async (params) => {
+      const { includeStackTrace, maxStackFrames, ...bridgeParams } = params || {};
+      const result = await bridge.getConsoleLog(bridgeParams);
+      return formatResult(shapeConsoleLogResult(result, includeStackTrace, maxStackFrames));
+    },
   },
   {
     name: "unity_console_clear",
     description: "Clear the Unity console log.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.clearConsoleLog(), null, 2),
+    handler: async () => formatResult(await bridge.clearConsoleLog()),
   },
 
   // â”€â”€â”€ Play Mode â”€â”€â”€
@@ -479,11 +607,8 @@ export const editorTools = [
   {
     name: "unity_get_compilation_errors",
     description:
-      "Get C# compilation errors and warnings from the Unity Editor. " +
-      "Uses CompilationPipeline directly — independent of the console log buffer. " +
-      "Not affected by console clear or Play Mode log flooding. " +
-      "Returns errors from the last compilation cycle. " +
-      "Use this instead of unity_console_log when diagnosing script compilation issues.",
+      "Get C# compilation errors/warnings via CompilationPipeline — independent of the console buffer " +
+      "(survives console clear and log flooding). Prefer this over unity_console_log for compile issues.",
     inputSchema: {
       type: "object",
       properties: {
@@ -491,7 +616,7 @@ export const editorTools = [
         severity: { type: "string", description: "Filter: 'error', 'warning', or 'all' (default: 'all')" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getCompilationErrors(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getCompilationErrors(params)),
   },
 
   // ─── Play Mode ───
@@ -505,7 +630,41 @@ export const editorTools = [
       },
       required: ["action"],
     },
-    handler: async ({ action }) => JSON.stringify(await bridge.playMode(action), null, 2),
+    handler: async ({ action }) => {
+      const result = await bridge.playMode(action);
+      // Entering/exiting play mode triggers a domain reload that evicts queue tickets —
+      // the status poll then 404s while the mode switch actually happened (a false
+      // negative). Before propagating that specific failure, verify the editor state:
+      // if it matches the requested action, the operation succeeded.
+      const ticketLost =
+        result && result.success === false &&
+        /HTTP 404|not found or expired/i.test(result.error || "");
+      if (ticketLost) {
+        try {
+          const state = await bridge.getEditorState();
+          const s = state && state.data !== undefined ? state.data : state;
+          const confirmed =
+            (action === "play" && s.isPlaying === true) ||
+            (action === "stop" && s.isPlaying === false) ||
+            (action === "pause" && s.isPaused === true);
+          if (confirmed) {
+            return formatResult({
+              success: true,
+              data: {
+                action,
+                isPlaying: s.isPlaying,
+                isPaused: s.isPaused,
+                verifiedViaEditorState: true,
+                note: "The play-mode domain reload evicted the queue ticket; the editor state confirms the switch happened.",
+              },
+            });
+          }
+        } catch (_) {
+          // State check unavailable — fall through to the original error.
+        }
+      }
+      return formatResult(result);
+    },
   },
 
   // â”€â”€â”€ Editor Menu â”€â”€â”€
@@ -519,7 +678,7 @@ export const editorTools = [
       },
       required: ["menuPath"],
     },
-    handler: async ({ menuPath }) => JSON.stringify(await bridge.executeMenuItem(menuPath), null, 2),
+    handler: async ({ menuPath }) => formatResult(await bridge.executeMenuItem(menuPath)),
   },
 
   // â”€â”€â”€ Project Info â”€â”€â”€
@@ -527,7 +686,7 @@ export const editorTools = [
     name: "unity_project_info",
     description: "Get project information: name, path, Unity version, render pipeline, packages, build settings.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.getProjectInfo(), null, 2),
+    handler: async () => formatResult(await bridge.getProjectInfo()),
   },
 
   // â”€â”€â”€ Animation â”€â”€â”€
@@ -538,10 +697,11 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Asset path for the controller (e.g. 'Assets/Animations/PlayerController.controller')" },
+        overwrite: { type: "boolean", description: "Replace an existing controller at this path (default false: refuse, to avoid losing its states/transitions)." },
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createAnimatorController(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createAnimatorController(params)),
   },
   {
     name: "unity_animation_controller_info",
@@ -553,7 +713,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getAnimatorControllerInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAnimatorControllerInfo(params)),
   },
   {
     name: "unity_animation_add_parameter",
@@ -564,11 +724,11 @@ export const editorTools = [
         controllerPath: { type: "string", description: "Asset path of the Animator Controller" },
         parameterName: { type: "string", description: "Name of the parameter to add" },
         parameterType: { type: "string", enum: ["Float", "Int", "Bool", "Trigger"], description: "Type of the parameter" },
-        defaultValue: { description: "Default value for the parameter (not applicable to Trigger)" },
+        defaultValue: { type: ["string", "number", "boolean", "null"], description: "Default value for the parameter (not applicable to Trigger)" },
       },
       required: ["controllerPath", "parameterName", "parameterType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addAnimationParameter(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addAnimationParameter(params)),
   },
   {
     name: "unity_animation_remove_parameter",
@@ -581,7 +741,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "parameterName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeAnimationParameter(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeAnimationParameter(params)),
   },
   {
     name: "unity_animation_add_state",
@@ -598,7 +758,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "stateName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addAnimationState(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addAnimationState(params)),
   },
   {
     name: "unity_animation_remove_state",
@@ -612,7 +772,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "stateName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeAnimationState(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeAnimationState(params)),
   },
   {
     name: "unity_animation_add_transition",
@@ -645,7 +805,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "destinationState"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addAnimationTransition(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addAnimationTransition(params)),
   },
   {
     name: "unity_animation_create_clip",
@@ -656,10 +816,11 @@ export const editorTools = [
         path: { type: "string", description: "Asset path for the clip (e.g. 'Assets/Animations/Walk.anim')" },
         loop: { type: "boolean", description: "Whether the clip should loop (default: false)" },
         frameRate: { type: "number", description: "Frame rate (default: 60)" },
+        overwrite: { type: "boolean", description: "Replace an existing clip at this path (default false: refuse, to avoid wiping its curves)." },
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createAnimationClip(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createAnimationClip(params)),
   },
   {
     name: "unity_animation_clip_info",
@@ -671,7 +832,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getAnimationClipInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAnimationClipInfo(params)),
   },
   {
     name: "unity_animation_set_clip_curve",
@@ -697,7 +858,38 @@ export const editorTools = [
       },
       required: ["clipPath", "propertyName", "keyframes"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setAnimationClipCurve(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setAnimationClipCurve(params)),
+  },
+  {
+    name: "unity_animation_set_object_reference_curve",
+    description:
+      "Set an OBJECT-REFERENCE (PPtr) animation curve — the curve type Unity uses for 2D sprite-frame " +
+      "animation (SpriteRenderer.m_Sprite). unity_animation_set_clip_curve only handles float curves. " +
+      "Each keyframe names an asset path; for a sliced sprite sheet add `name` to pick a specific sprite " +
+      "sub-asset. Fails closed if any keyframe can't be resolved, so a clip is never half-wired.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        clipPath: { type: "string", description: "Asset path of the Animation Clip" },
+        relativePath: { type: "string", description: "Path to the animated child object (empty for the root)" },
+        propertyName: { type: "string", description: "Property to animate (default 'm_Sprite')" },
+        type: { type: "string", description: "Component type (default 'SpriteRenderer')" },
+        keyframes: {
+          type: "array",
+          description: "Ordered keyframes; each { time, assetPath, name? }",
+          items: {
+            type: "object",
+            properties: {
+              time: { type: "number", description: "Time in seconds" },
+              assetPath: { type: "string", description: "Asset path of the referenced object (e.g. the sprite sheet)" },
+              name: { type: "string", description: "Sub-asset name — required to pick one sprite out of a sliced sheet" },
+            },
+          },
+        },
+      },
+      required: ["clipPath", "keyframes"],
+    },
+    handler: async (params) => formatResult(await bridge.setAnimationObjectReferenceCurve(params)),
   },
   {
     name: "unity_animation_add_layer",
@@ -711,7 +903,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "layerName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addAnimationLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addAnimationLayer(params)),
   },
   {
     name: "unity_animation_assign_controller",
@@ -720,12 +912,12 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name of the target GameObject" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
         controllerPath: { type: "string", description: "Asset path of the Animator Controller to assign" },
       },
       required: ["controllerPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.assignAnimatorController(params), null, 2),
+    handler: async (params) => formatResult(await bridge.assignAnimatorController(params)),
   },
   {
     name: "unity_animation_get_curve_keyframes",
@@ -740,7 +932,7 @@ export const editorTools = [
       },
       required: ["clipPath", "propertyName", "typeName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getCurveKeyframes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getCurveKeyframes(params)),
   },
   {
     name: "unity_animation_remove_curve",
@@ -755,7 +947,7 @@ export const editorTools = [
       },
       required: ["clipPath", "propertyName", "typeName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeCurve(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeCurve(params)),
   },
   {
     name: "unity_animation_add_keyframe",
@@ -777,7 +969,7 @@ export const editorTools = [
       },
       required: ["clipPath", "propertyName", "typeName", "time", "value"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addKeyframe(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addKeyframe(params)),
   },
   {
     name: "unity_animation_remove_keyframe",
@@ -793,7 +985,7 @@ export const editorTools = [
       },
       required: ["clipPath", "propertyName", "typeName", "keyframeIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeKeyframe(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeKeyframe(params)),
   },
   {
     name: "unity_animation_add_event",
@@ -810,7 +1002,7 @@ export const editorTools = [
       },
       required: ["clipPath", "functionName", "time"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addAnimationEvent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addAnimationEvent(params)),
   },
   {
     name: "unity_animation_remove_event",
@@ -823,7 +1015,7 @@ export const editorTools = [
       },
       required: ["clipPath", "eventIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeAnimationEvent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeAnimationEvent(params)),
   },
   {
     name: "unity_animation_get_events",
@@ -835,7 +1027,7 @@ export const editorTools = [
       },
       required: ["clipPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getAnimationEvents(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAnimationEvents(params)),
   },
   {
     name: "unity_animation_set_clip_settings",
@@ -858,7 +1050,7 @@ export const editorTools = [
       },
       required: ["clipPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setClipSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setClipSettings(params)),
   },
   {
     name: "unity_animation_remove_transition",
@@ -874,7 +1066,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "sourceState"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeAnimationTransition(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeAnimationTransition(params)),
   },
   {
     name: "unity_animation_remove_layer",
@@ -887,7 +1079,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "layerIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeAnimationLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeAnimationLayer(params)),
   },
   {
     name: "unity_animation_create_blend_tree",
@@ -917,7 +1109,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "blendTreeName", "blendParameter"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createBlendTree(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createBlendTree(params)),
   },
   {
     name: "unity_animation_get_blend_tree",
@@ -931,7 +1123,7 @@ export const editorTools = [
       },
       required: ["controllerPath", "stateName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getBlendTreeInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getBlendTreeInfo(params)),
   },
 
   // â”€â”€â”€ Prefab (Advanced) â”€â”€â”€
@@ -943,10 +1135,10 @@ export const editorTools = [
       properties: {
         assetPath: { type: "string", description: "Asset path of the prefab (e.g. 'Assets/Prefabs/Player.prefab')" },
         path: { type: "string", description: "Hierarchy path of a prefab instance in the scene" },
-        instanceId: { type: "number", description: "Instance ID of a prefab instance" },
+        instanceId: { type: "string", description: "Instance ID of a prefab instance" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getPrefabInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPrefabInfo(params)),
   },
   {
     name: "unity_prefab_create_variant",
@@ -959,7 +1151,7 @@ export const editorTools = [
       },
       required: ["basePrefabPath", "variantPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createPrefabVariant(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createPrefabVariant(params)),
   },
   {
     name: "unity_prefab_apply_overrides",
@@ -968,10 +1160,10 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path of the prefab instance" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.applyPrefabOverrides(params), null, 2),
+    handler: async (params) => formatResult(await bridge.applyPrefabOverrides(params)),
   },
   {
     name: "unity_prefab_revert_overrides",
@@ -980,10 +1172,10 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path of the prefab instance" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.revertPrefabOverrides(params), null, 2),
+    handler: async (params) => formatResult(await bridge.revertPrefabOverrides(params)),
   },
   {
     name: "unity_prefab_unpack",
@@ -992,20 +1184,20 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path of the prefab instance" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
         completely: { type: "boolean", description: "If true, unpack completely including nested prefabs (default: false)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.unpackPrefab(params), null, 2),
+    handler: async (params) => formatResult(await bridge.unpackPrefab(params)),
   },
   {
     name: "unity_set_object_reference",
-    description: "[LEGACY â€” prefer unity_component_set_reference] Set an object reference property on a component via the prefab system. Use unity_component_set_reference instead for richer resolution options.",
+    description: "[LEGACY] Set an object reference on a component. Prefer unity_component_set_reference (richer resolution).",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path of the target GameObject" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
         componentType: { type: "string", description: "Component type name (optional - will search all components)" },
         propertyName: { type: "string", description: "Name of the ObjectReference property to set" },
         referencePath: { type: "string", description: "Asset path of the reference (for assets like prefabs, materials, textures)" },
@@ -1013,7 +1205,7 @@ export const editorTools = [
       },
       required: ["propertyName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setObjectReference(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setObjectReference(params)),
   },
   {
     name: "unity_gameobject_duplicate",
@@ -1022,11 +1214,11 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name of the GameObject to duplicate" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
         newName: { type: "string", description: "Name for the duplicate (default: original name + ' (Copy)')" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.duplicateGameObject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.duplicateGameObject(params)),
   },
   {
     name: "unity_gameobject_set_active",
@@ -1035,12 +1227,12 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name of the GameObject" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
         active: { type: "boolean", description: "Whether the GameObject should be active" },
       },
       required: ["active"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setGameObjectActive(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setGameObjectActive(params)),
   },
   {
     name: "unity_gameobject_reparent",
@@ -1049,12 +1241,12 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Hierarchy path or name of the GameObject to move" },
-        instanceId: { type: "number", description: "Instance ID (alternative to path)" },
+        instanceId: { type: "string", description: "Instance ID (alternative to path)" },
         newParent: { type: "string", description: "Path of the new parent (empty string for scene root)" },
         worldPositionStays: { type: "boolean", description: "Maintain world position after reparenting (default: true)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.reparentGameObject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.reparentGameObject(params)),
   },
 
   // â”€â”€â”€ Prefab Asset (Direct Editing) â”€â”€â”€
@@ -1069,7 +1261,7 @@ export const editorTools = [
       },
       required: ["assetPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getPrefabAssetHierarchy(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPrefabAssetHierarchy(params)),
   },
   {
     name: "unity_prefab_get_properties",
@@ -1083,7 +1275,7 @@ export const editorTools = [
       },
       required: ["assetPath", "componentType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getPrefabAssetProperties(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPrefabAssetProperties(params)),
   },
   {
     name: "unity_prefab_set_property",
@@ -1095,11 +1287,11 @@ export const editorTools = [
         prefabPath: { type: "string", description: "Path within the prefab hierarchy (e.g. 'Body/Head'). Empty = root." },
         componentType: { type: "string", description: "Component type name" },
         propertyName: { type: "string", description: "Name of the property to set" },
-        value: { description: "Value to set (type depends on property)" },
+        value: { type: ["string", "number", "boolean", "object", "array", "null"], description: "Value to set (type depends on property)" },
       },
       required: ["assetPath", "componentType", "propertyName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setPrefabAssetProperty(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setPrefabAssetProperty(params)),
   },
   {
     name: "unity_prefab_add_component",
@@ -1113,7 +1305,7 @@ export const editorTools = [
       },
       required: ["assetPath", "componentType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addPrefabAssetComponent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addPrefabAssetComponent(params)),
   },
   {
     name: "unity_prefab_remove_component",
@@ -1128,7 +1320,7 @@ export const editorTools = [
       },
       required: ["assetPath", "componentType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removePrefabAssetComponent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removePrefabAssetComponent(params)),
   },
   {
     name: "unity_prefab_set_reference",
@@ -1147,7 +1339,7 @@ export const editorTools = [
       },
       required: ["assetPath", "propertyName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setPrefabAssetReference(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setPrefabAssetReference(params)),
   },
   {
     name: "unity_prefab_add_gameobject",
@@ -1165,7 +1357,7 @@ export const editorTools = [
       },
       required: ["assetPath", "name"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addPrefabAssetGameObject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addPrefabAssetGameObject(params)),
   },
   {
     name: "unity_prefab_remove_gameobject",
@@ -1178,7 +1370,7 @@ export const editorTools = [
       },
       required: ["assetPath", "prefabPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removePrefabAssetGameObject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removePrefabAssetGameObject(params)),
   },
 
   // â”€â”€â”€ Prefab Variant Management â”€â”€â”€
@@ -1192,7 +1384,7 @@ export const editorTools = [
       },
       required: ["assetPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getPrefabVariantInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPrefabVariantInfo(params)),
   },
   {
     name: "unity_prefab_compare_variant",
@@ -1204,7 +1396,7 @@ export const editorTools = [
       },
       required: ["assetPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.comparePrefabVariantToBase(params), null, 2),
+    handler: async (params) => formatResult(await bridge.comparePrefabVariantToBase(params)),
   },
   {
     name: "unity_prefab_apply_variant_override",
@@ -1219,7 +1411,7 @@ export const editorTools = [
       },
       required: ["assetPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.applyPrefabVariantOverride(params), null, 2),
+    handler: async (params) => formatResult(await bridge.applyPrefabVariantOverride(params)),
   },
   {
     name: "unity_prefab_revert_variant_override",
@@ -1234,7 +1426,7 @@ export const editorTools = [
       },
       required: ["assetPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.revertPrefabVariantOverride(params), null, 2),
+    handler: async (params) => formatResult(await bridge.revertPrefabVariantOverride(params)),
   },
   {
     name: "unity_prefab_transfer_variant_overrides",
@@ -1247,7 +1439,7 @@ export const editorTools = [
       },
       required: ["sourceAssetPath", "targetAssetPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.transferPrefabVariantOverrides(params), null, 2),
+    handler: async (params) => formatResult(await bridge.transferPrefabVariantOverrides(params)),
   },
 
   // â”€â”€â”€ Physics â”€â”€â”€
@@ -1265,7 +1457,7 @@ export const editorTools = [
       },
       required: ["origin", "direction"],
     },
-    handler: async (params) => JSON.stringify(await bridge.physicsRaycast(params), null, 2),
+    handler: async (params) => formatResult(await bridge.physicsRaycast(params)),
   },
   {
     name: "unity_physics_overlap_sphere",
@@ -1279,7 +1471,7 @@ export const editorTools = [
       },
       required: ["center", "radius"],
     },
-    handler: async (params) => JSON.stringify(await bridge.physicsOverlapSphere(params), null, 2),
+    handler: async (params) => formatResult(await bridge.physicsOverlapSphere(params)),
   },
   {
     name: "unity_physics_overlap_box",
@@ -1293,13 +1485,13 @@ export const editorTools = [
       },
       required: ["center", "halfExtents"],
     },
-    handler: async (params) => JSON.stringify(await bridge.physicsOverlapBox(params), null, 2),
+    handler: async (params) => formatResult(await bridge.physicsOverlapBox(params)),
   },
   {
     name: "unity_physics_collision_matrix",
     description: "Get the physics collision matrix showing which layers collide with each other.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getCollisionMatrix(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getCollisionMatrix(params)),
   },
   {
     name: "unity_physics_set_collision_layer",
@@ -1314,7 +1506,7 @@ export const editorTools = [
         ignore: { type: "boolean", description: "If true, layers will ignore each other (default: true)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setCollisionLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setCollisionLayer(params)),
   },
   {
     name: "unity_physics_set_gravity",
@@ -1325,7 +1517,7 @@ export const editorTools = [
         gravity: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } }, description: "New gravity vector (omit to just read current)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setGravity(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setGravity(params)),
   },
 
   // â”€â”€â”€ Lighting â”€â”€â”€
@@ -1333,7 +1525,7 @@ export const editorTools = [
     name: "unity_lighting_info",
     description: "Get info about all lights in the scene plus environment/fog settings.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getLightingInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getLightingInfo(params)),
   },
   {
     name: "unity_lighting_create",
@@ -1352,7 +1544,7 @@ export const editorTools = [
         rotation: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.createLight(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createLight(params)),
   },
   {
     name: "unity_lighting_set_environment",
@@ -1370,7 +1562,7 @@ export const editorTools = [
         skyboxMaterialPath: { type: "string", description: "Asset path to skybox material" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setEnvironment(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setEnvironment(params)),
   },
   {
     name: "unity_lighting_create_reflection_probe",
@@ -1385,7 +1577,7 @@ export const editorTools = [
         mode: { type: "string", enum: ["Baked", "Realtime", "Custom"], description: "Probe mode" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.createReflectionProbe(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createReflectionProbe(params)),
   },
   {
     name: "unity_lighting_create_light_probe_group",
@@ -1397,7 +1589,7 @@ export const editorTools = [
         position: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.createLightProbeGroup(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createLightProbeGroup(params)),
   },
 
   // â”€â”€â”€ Audio â”€â”€â”€
@@ -1405,7 +1597,7 @@ export const editorTools = [
     name: "unity_audio_info",
     description: "Get info about all AudioSources and AudioListeners in the scene.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getAudioInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAudioInfo(params)),
   },
   {
     name: "unity_audio_create_source",
@@ -1415,7 +1607,7 @@ export const editorTools = [
       properties: {
         name: { type: "string", description: "Name for new GameObject (if not attaching to existing)" },
         path: { type: "string", description: "Path of existing GameObject to attach AudioSource to" },
-        instanceId: { type: "integer", description: "Instance ID of existing GameObject" },
+        instanceId: { type: "string", description: "Instance ID of existing GameObject" },
         clipPath: { type: "string", description: "Asset path to AudioClip (e.g. 'Assets/Audio/music.wav')" },
         volume: { type: "number", description: "Volume (0-1)" },
         pitch: { type: "number", description: "Pitch multiplier" },
@@ -1427,7 +1619,7 @@ export const editorTools = [
         position: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.createAudioSource(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createAudioSource(params)),
   },
   {
     name: "unity_audio_set_global",
@@ -1439,7 +1631,7 @@ export const editorTools = [
         pause: { type: "boolean", description: "Pause/unpause all audio" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setGlobalAudio(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setGlobalAudio(params)),
   },
 
   // â”€â”€â”€ Tags & Layers â”€â”€â”€
@@ -1447,7 +1639,7 @@ export const editorTools = [
     name: "unity_taglayer_info",
     description: "Get all tags, layers, and sorting layers in the project.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getTagsAndLayers(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTagsAndLayers(params)),
   },
   {
     name: "unity_taglayer_add_tag",
@@ -1459,7 +1651,7 @@ export const editorTools = [
       },
       required: ["tag"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addTag(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addTag(params)),
   },
   {
     name: "unity_taglayer_set_tag",
@@ -1468,12 +1660,12 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "integer", description: "GameObject instance ID" },
+        instanceId: { type: "string", description: "GameObject instance ID" },
         tag: { type: "string", description: "Tag to assign" },
       },
       required: ["tag"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTag(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTag(params)),
   },
   {
     name: "unity_taglayer_set_layer",
@@ -1482,13 +1674,13 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "integer", description: "GameObject instance ID" },
+        instanceId: { type: "string", description: "GameObject instance ID" },
         layer: { type: "integer", description: "Layer index (0-31)" },
         layerName: { type: "string", description: "Layer name (alternative to index)" },
         includeChildren: { type: "boolean", description: "Apply to all children recursively" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setLayer(params)),
   },
   {
     name: "unity_taglayer_set_static",
@@ -1497,12 +1689,12 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "integer", description: "GameObject instance ID" },
+        instanceId: { type: "string", description: "GameObject instance ID" },
         isStatic: { type: "boolean", description: "True to mark static" },
         includeChildren: { type: "boolean", description: "Apply to all children recursively" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setStatic(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setStatic(params)),
   },
 
   // â”€â”€â”€ Selection & Scene View â”€â”€â”€
@@ -1510,7 +1702,7 @@ export const editorTools = [
     name: "unity_selection_get",
     description: "Get the currently selected GameObjects in the Unity Editor.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getSelection(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getSelection(params)),
   },
   {
     name: "unity_selection_set",
@@ -1520,10 +1712,10 @@ export const editorTools = [
       properties: {
         path: { type: "string", description: "Single GameObject path to select" },
         paths: { type: "array", items: { type: "string" }, description: "Multiple GameObject paths to select" },
-        instanceId: { type: "integer", description: "Instance ID of GameObject to select" },
+        instanceId: { type: "string", description: "Instance ID of GameObject to select" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setSelection(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setSelection(params)),
   },
   {
     name: "unity_selection_focus_scene_view",
@@ -1532,14 +1724,14 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject to frame in scene view" },
-        instanceId: { type: "integer", description: "Instance ID of GameObject to frame" },
+        instanceId: { type: "string", description: "Instance ID of GameObject to frame" },
         position: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } }, description: "Scene view pivot position" },
         rotation: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } }, description: "Scene view rotation (euler angles)" },
         size: { type: "number", description: "Scene view zoom (camera distance)" },
         orthographic: { type: "boolean", description: "Toggle orthographic/perspective" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.focusSceneView(params), null, 2),
+    handler: async (params) => formatResult(await bridge.focusSceneView(params)),
   },
   {
     name: "unity_selection_find_by_type",
@@ -1551,7 +1743,7 @@ export const editorTools = [
       },
       required: ["typeName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.findObjectsByType(params), null, 2),
+    handler: async (params) => formatResult(await bridge.findObjectsByType(params)),
   },
 
   // â”€â”€â”€ Agent Management â”€â”€â”€
@@ -1577,7 +1769,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createInputActions(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createInputActions(params)),
   },
   {
     name: "unity_input_info",
@@ -1589,7 +1781,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getInputActionsInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getInputActionsInfo(params)),
   },
   {
     name: "unity_input_add_map",
@@ -1602,7 +1794,7 @@ export const editorTools = [
       },
       required: ["path", "mapName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addInputActionMap(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addInputActionMap(params)),
   },
   {
     name: "unity_input_remove_map",
@@ -1615,7 +1807,7 @@ export const editorTools = [
       },
       required: ["path", "mapName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeInputActionMap(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeInputActionMap(params)),
   },
   {
     name: "unity_input_add_action",
@@ -1631,7 +1823,7 @@ export const editorTools = [
       },
       required: ["path", "mapName", "actionName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addInputAction(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addInputAction(params)),
   },
   {
     name: "unity_input_remove_action",
@@ -1645,7 +1837,7 @@ export const editorTools = [
       },
       required: ["path", "mapName", "actionName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeInputAction(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeInputAction(params)),
   },
   {
     name: "unity_input_add_binding",
@@ -1660,7 +1852,7 @@ export const editorTools = [
       },
       required: ["path", "mapName", "actionName", "bindingPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addInputBinding(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addInputBinding(params)),
   },
   {
     name: "unity_input_add_composite_binding",
@@ -1688,7 +1880,7 @@ export const editorTools = [
       },
       required: ["path", "mapName", "actionName", "compositeName", "parts"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addInputCompositeBinding(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addInputCompositeBinding(params)),
   },
 
   // â”€â”€â”€ Assembly Definitions â”€â”€â”€
@@ -1733,7 +1925,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createAssemblyDef(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createAssemblyDef(params)),
   },
   {
     name: "unity_asmdef_info",
@@ -1745,7 +1937,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getAssemblyDefInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAssemblyDefInfo(params)),
   },
   {
     name: "unity_asmdef_list",
@@ -1757,7 +1949,7 @@ export const editorTools = [
         includePackages: { type: "boolean", description: "Also list assembly definitions from Packages/ (default: false)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.listAssemblyDefs(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listAssemblyDefs(params)),
   },
   {
     name: "unity_asmdef_add_references",
@@ -1774,7 +1966,7 @@ export const editorTools = [
       },
       required: ["path", "references"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addAssemblyDefReferences(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addAssemblyDefReferences(params)),
   },
   {
     name: "unity_asmdef_remove_references",
@@ -1791,7 +1983,7 @@ export const editorTools = [
       },
       required: ["path", "references"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeAssemblyDefReferences(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeAssemblyDefReferences(params)),
   },
   {
     name: "unity_asmdef_set_platforms",
@@ -1813,7 +2005,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setAssemblyDefPlatforms(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setAssemblyDefPlatforms(params)),
   },
   {
     name: "unity_asmdef_update_settings",
@@ -1841,7 +2033,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.updateAssemblyDefSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.updateAssemblyDefSettings(params)),
   },
   {
     name: "unity_asmdef_create_ref",
@@ -1854,7 +2046,7 @@ export const editorTools = [
       },
       required: ["path", "reference"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createAssemblyRef(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createAssemblyRef(params)),
   },
 
   // â”€â”€â”€ Profiler â”€â”€â”€
@@ -1869,19 +2061,19 @@ export const editorTools = [
       },
       required: ["enabled"],
     },
-    handler: async (params) => JSON.stringify(await bridge.enableProfiler(params), null, 2),
+    handler: async (params) => formatResult(await bridge.enableProfiler(params)),
   },
   {
     name: "unity_profiler_stats",
     description: "Get current rendering statistics: draw calls, batches, triangles, vertices, set-pass calls, frame time, render time, shadow casters, and more. The profiler does NOT need to be enabled for this â€” stats come from UnityStats which is always available.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getRenderingStats(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getRenderingStats(params)),
   },
   {
     name: "unity_profiler_memory",
     description: "Get detailed memory usage breakdown: total allocated, reserved, Mono heap used/size, graphics driver memory, temp allocator size, and GC info. Values are returned in both bytes and human-readable MB.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getMemoryInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getMemoryInfo(params)),
   },
   {
     name: "unity_profiler_frame_data",
@@ -1895,13 +2087,13 @@ export const editorTools = [
         minTimeMs: { type: "number", description: "Minimum total time in ms to include an item (default: 0.1)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getProfilerFrameData(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getProfilerFrameData(params)),
   },
   {
     name: "unity_profiler_analyze",
     description: "Run a comprehensive performance analysis combining memory, rendering stats, profiler frame data, and scene complexity. Returns optimization suggestions based on configurable thresholds (e.g. too many batches, high triangle count, excessive set-pass calls, GPU memory usage, shadow casters).",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.analyzePerformance(params), null, 2),
+    handler: async (params) => formatResult(await bridge.analyzePerformance(params)),
   },
 
   // â”€â”€â”€ Frame Debugger â”€â”€â”€
@@ -1915,13 +2107,13 @@ export const editorTools = [
       },
       required: ["enabled"],
     },
-    handler: async (params) => JSON.stringify(await bridge.enableFrameDebugger(params), null, 2),
+    handler: async (params) => formatResult(await bridge.enableFrameDebugger(params)),
   },
   {
     name: "unity_debugger_events",
     description: "List all rendering events (draw calls) captured by the Frame Debugger. The Frame Debugger must be enabled first. Returns event index, type, and name for each draw call.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getFrameDebuggerEvents(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getFrameDebuggerEvents(params)),
   },
   {
     name: "unity_debugger_event_details",
@@ -1933,7 +2125,7 @@ export const editorTools = [
       },
       required: ["eventIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getFrameDebuggerEventDetails(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getFrameDebuggerEventDetails(params)),
   },
 
   // â”€â”€â”€ Memory Profiler â”€â”€â”€
@@ -1941,7 +2133,7 @@ export const editorTools = [
     name: "unity_memory_status",
     description: "Check Memory Profiler status: whether the com.unity.memoryprofiler package is installed, available commands, and a quick memory summary. Always call this first before other memory profiler commands.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getMemoryStatus(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getMemoryStatus(params)),
   },
   {
     name: "unity_memory_breakdown",
@@ -1953,7 +2145,7 @@ export const editorTools = [
         maxPerCategory: { type: "number", description: "Max assets to list per category when includeDetails=true (default: 5)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getMemoryBreakdown(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getMemoryBreakdown(params)),
   },
   {
     name: "unity_memory_top_assets",
@@ -1965,7 +2157,7 @@ export const editorTools = [
         type: { type: "string", description: "Filter by asset type: texture, rendertexture, mesh, audio, material, shader, animation, font (default: all)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getTopMemoryConsumers(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTopMemoryConsumers(params)),
   },
   {
     name: "unity_memory_snapshot",
@@ -1976,7 +2168,7 @@ export const editorTools = [
         path: { type: "string", description: "Directory to save snapshot in (default: temp cache)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.takeMemorySnapshot(params), null, 2),
+    handler: async (params) => formatResult(await bridge.takeMemorySnapshot(params)),
   },
 
   // â”€â”€â”€ Shader Graph â”€â”€â”€
@@ -1984,7 +2176,7 @@ export const editorTools = [
     name: "unity_shadergraph_status",
     description: "Check which graph packages are installed: Shader Graph (com.unity.shadergraph) and Visual Effect Graph (com.unity.visualeffectgraph). Returns available commands based on installed packages.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getShaderGraphStatus(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getShaderGraphStatus(params)),
   },
   {
     name: "unity_shader_list",
@@ -1997,7 +2189,7 @@ export const editorTools = [
         maxResults: { type: "number", description: "Maximum results to return (default: 100)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.listShaders(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listShaders(params)),
   },
   {
     name: "unity_shadergraph_list",
@@ -2009,7 +2201,7 @@ export const editorTools = [
         maxResults: { type: "number", description: "Maximum results (default: 100)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.listShaderGraphs(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listShaderGraphs(params)),
   },
   {
     name: "unity_shadergraph_info",
@@ -2021,7 +2213,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getShaderGraphInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getShaderGraphInfo(params)),
   },
   {
     name: "unity_shader_get_properties",
@@ -2033,7 +2225,7 @@ export const editorTools = [
         shaderName: { type: "string", description: "Shader name (e.g. 'Universal Render Pipeline/Lit'). Alternative to path." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getShaderProperties(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getShaderProperties(params)),
   },
   {
     name: "unity_shadergraph_create",
@@ -2042,11 +2234,12 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "Asset path for the new shader graph (e.g. 'Assets/Shaders/MyShader.shadergraph')" },
-        template: { type: "string", description: "Template type: urp_lit, urp_unlit, urp_sprite_lit, urp_sprite_unlit, urp_decal, hdrp_lit, hdrp_unlit, blank (default: urp_lit)" },
+        template: { type: "string", description: "Template: urp_lit, urp_unlit, urp_sprite_lit, urp_sprite_unlit, or blank (target-less). Default urp_lit. Builds a valid graph via the real ShaderGraph API." },
+        overwrite: { type: "boolean", description: "Replace an existing graph at this path (default false: refuse)." },
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createShaderGraph(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createShaderGraph(params)),
   },
   {
     name: "unity_shadergraph_open",
@@ -2058,19 +2251,19 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.openShaderGraph(params), null, 2),
+    handler: async (params) => formatResult(await bridge.openShaderGraph(params)),
   },
   {
     name: "unity_shadergraph_list_subgraphs",
     description: "List all Sub Graph (.shadersubgraph) assets in the project. Sub Graphs are reusable node groups for Shader Graphs. Requires Shader Graph package.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.listSubGraphs(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listSubGraphs(params)),
   },
   {
     name: "unity_vfx_list",
     description: "List all Visual Effect Graph assets in the project. Requires Visual Effect Graph package (com.unity.visualeffectgraph).",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.listVFXGraphs(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listVFXGraphs(params)),
   },
   {
     name: "unity_vfx_open",
@@ -2082,7 +2275,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.openVFXGraph(params), null, 2),
+    handler: async (params) => formatResult(await bridge.openVFXGraph(params)),
   },
   {
     name: "unity_shadergraph_get_nodes",
@@ -2094,7 +2287,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getShaderGraphNodes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getShaderGraphNodes(params)),
   },
   {
     name: "unity_shadergraph_get_edges",
@@ -2106,7 +2299,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getShaderGraphEdges(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getShaderGraphEdges(params)),
   },
   {
     name: "unity_shadergraph_add_node",
@@ -2121,7 +2314,7 @@ export const editorTools = [
       },
       required: ["path", "nodeType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addShaderGraphNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addShaderGraphNode(params)),
   },
   {
     name: "unity_shadergraph_remove_node",
@@ -2134,7 +2327,7 @@ export const editorTools = [
       },
       required: ["path", "nodeId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeShaderGraphNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeShaderGraphNode(params)),
   },
   {
     name: "unity_shadergraph_connect",
@@ -2150,7 +2343,7 @@ export const editorTools = [
       },
       required: ["path", "outputNodeId", "outputSlotId", "inputNodeId", "inputSlotId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.connectShaderGraphNodes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.connectShaderGraphNodes(params)),
   },
   {
     name: "unity_shadergraph_disconnect",
@@ -2166,7 +2359,7 @@ export const editorTools = [
       },
       required: ["path", "outputNodeId", "outputSlotId", "inputNodeId", "inputSlotId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.disconnectShaderGraphNodes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.disconnectShaderGraphNodes(params)),
   },
   {
     name: "unity_shadergraph_set_node_property",
@@ -2177,17 +2370,17 @@ export const editorTools = [
         path: { type: "string", description: "Asset path of the .shadergraph file" },
         nodeId: { type: "string", description: "Target node objectId" },
         propertyName: { type: "string", description: "Property name in the serialized JSON (e.g., 'm_Value', 'm_DefaultValue')" },
-        value: { description: "New value â€” string, number, or boolean depending on the property" },
+        value: { type: ["string", "number", "boolean"], description: "New value â€” string, number, or boolean depending on the property" },
       },
       required: ["path", "nodeId", "propertyName", "value"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setShaderGraphNodeProperty(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setShaderGraphNodeProperty(params)),
   },
   {
     name: "unity_shadergraph_get_node_types",
     description: "List all available Shader Graph node types by reflecting over the ShaderGraph assembly. Returns type names, categories, and full class names. Useful for discovering available nodes before adding them.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getShaderGraphNodeTypes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getShaderGraphNodeTypes(params)),
   },
 
   // â”€â”€â”€ Amplify Shader Editor â”€â”€â”€
@@ -2195,7 +2388,7 @@ export const editorTools = [
     name: "unity_amplify_status",
     description: "Check if Amplify Shader Editor is installed in the project. Returns available commands, shader count, and function count. Only works when Amplify Shader Editor is imported.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getAmplifyStatus(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAmplifyStatus(params)),
   },
   {
     name: "unity_amplify_list",
@@ -2207,7 +2400,7 @@ export const editorTools = [
         maxResults: { type: "number", description: "Maximum results (default: 100)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.listAmplifyShaders(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listAmplifyShaders(params)),
   },
   {
     name: "unity_amplify_info",
@@ -2219,7 +2412,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getAmplifyShaderInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAmplifyShaderInfo(params)),
   },
   {
     name: "unity_amplify_open",
@@ -2231,31 +2424,31 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.openAmplifyShader(params), null, 2),
+    handler: async (params) => formatResult(await bridge.openAmplifyShader(params)),
   },
   {
     name: "unity_amplify_list_functions",
     description: "List all Amplify Shader Functions in the project. Functions are reusable node groups (similar to Shader Graph Sub Graphs). Only available when Amplify is installed.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.listAmplifyFunctions(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listAmplifyFunctions(params)),
   },
   {
     name: "unity_amplify_get_node_types",
     description: "List all available Amplify Shader Editor node types by reflecting over the ASE assembly. Returns type names, categories, and descriptions. Requires Amplify to be installed.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getAmplifyNodeTypes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAmplifyNodeTypes(params)),
   },
   {
     name: "unity_amplify_get_nodes",
     description: "Get all nodes in the currently open Amplify Shader Editor graph. Returns node IDs, types, positions, and port counts. The ASE window must be open with a shader loaded.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getAmplifyGraphNodes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAmplifyGraphNodes(params)),
   },
   {
     name: "unity_amplify_get_connections",
     description: "Get all connections between nodes in the currently open Amplify Shader Editor graph. Shows which output ports connect to which input ports.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getAmplifyGraphConnections(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAmplifyGraphConnections(params)),
   },
   {
     name: "unity_amplify_create_shader",
@@ -2268,7 +2461,7 @@ export const editorTools = [
       },
       required: ["path", "shaderName"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createAmplifyShader(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createAmplifyShader(params)),
   },
   {
     name: "unity_amplify_add_node",
@@ -2282,7 +2475,7 @@ export const editorTools = [
       },
       required: ["nodeType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addAmplifyNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addAmplifyNode(params)),
   },
   {
     name: "unity_amplify_remove_node",
@@ -2294,7 +2487,7 @@ export const editorTools = [
       },
       required: ["nodeId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeAmplifyNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeAmplifyNode(params)),
   },
   {
     name: "unity_amplify_connect",
@@ -2309,7 +2502,7 @@ export const editorTools = [
       },
       required: ["outputNodeId", "outputPortId", "inputNodeId", "inputPortId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.connectAmplifyNodes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.connectAmplifyNodes(params)),
   },
   {
     name: "unity_amplify_disconnect",
@@ -2323,7 +2516,7 @@ export const editorTools = [
       },
       required: ["nodeId", "portId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.disconnectAmplifyNodes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.disconnectAmplifyNodes(params)),
   },
   {
     name: "unity_amplify_node_info",
@@ -2335,7 +2528,7 @@ export const editorTools = [
       },
       required: ["nodeId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getAmplifyNodeInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAmplifyNodeInfo(params)),
   },
   {
     name: "unity_amplify_set_node_property",
@@ -2349,7 +2542,7 @@ export const editorTools = [
       },
       required: ["nodeId", "propertyName", "value"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setAmplifyNodeProperty(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setAmplifyNodeProperty(params)),
   },
   {
     name: "unity_amplify_move_node",
@@ -2363,7 +2556,7 @@ export const editorTools = [
       },
       required: ["nodeId", "x", "y"],
     },
-    handler: async (params) => JSON.stringify(await bridge.moveAmplifyNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.moveAmplifyNode(params)),
   },
   {
     name: "unity_amplify_save",
@@ -2374,7 +2567,7 @@ export const editorTools = [
         path: { type: "string", description: "Optional asset path to save to (e.g. 'Assets/Shaders/MyShader.shader'). Only needed if the shader has never been saved before." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.saveAmplifyGraph(params), null, 2),
+    handler: async (params) => formatResult(await bridge.saveAmplifyGraph(params)),
   },
   {
     name: "unity_amplify_close",
@@ -2385,7 +2578,7 @@ export const editorTools = [
         save: { type: "boolean", description: "Save the graph before closing (default: true)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.closeAmplifyEditor(params), null, 2),
+    handler: async (params) => formatResult(await bridge.closeAmplifyEditor(params)),
   },
   {
     name: "unity_amplify_create_from_template",
@@ -2399,7 +2592,7 @@ export const editorTools = [
       },
       required: ["path", "shaderName", "template"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createAmplifyFromTemplate(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createAmplifyFromTemplate(params)),
   },
   {
     name: "unity_amplify_focus_node",
@@ -2413,13 +2606,13 @@ export const editorTools = [
       },
       required: ["nodeId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.focusAmplifyNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.focusAmplifyNode(params)),
   },
   {
     name: "unity_amplify_master_node_info",
     description: "Get detailed information about the master/output node of the currently open Amplify shader graph, including all its input ports and properties.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getAmplifyMasterNodeInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getAmplifyMasterNodeInfo(params)),
   },
   {
     name: "unity_amplify_disconnect_all",
@@ -2431,7 +2624,7 @@ export const editorTools = [
       },
       required: ["nodeId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.disconnectAllAmplifyNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.disconnectAllAmplifyNode(params)),
   },
   {
     name: "unity_amplify_duplicate_node",
@@ -2445,7 +2638,7 @@ export const editorTools = [
       },
       required: ["nodeId"],
     },
-    handler: async (params) => JSON.stringify(await bridge.duplicateAmplifyNode(params), null, 2),
+    handler: async (params) => formatResult(await bridge.duplicateAmplifyNode(params)),
   },
 
   // â”€â”€â”€ Search & Find â”€â”€â”€
@@ -2461,7 +2654,7 @@ export const editorTools = [
       },
       required: ["componentType"],
     },
-    handler: async (params) => JSON.stringify(await bridge.findByComponent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.findByComponent(params)),
   },
   {
     name: "unity_search_by_tag",
@@ -2474,7 +2667,7 @@ export const editorTools = [
       },
       required: ["tag"],
     },
-    handler: async (params) => JSON.stringify(await bridge.findByTag(params), null, 2),
+    handler: async (params) => formatResult(await bridge.findByTag(params)),
   },
   {
     name: "unity_search_by_layer",
@@ -2487,7 +2680,7 @@ export const editorTools = [
       },
       required: ["layer"],
     },
-    handler: async (params) => JSON.stringify(await bridge.findByLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.findByLayer(params)),
   },
   {
     name: "unity_search_by_name",
@@ -2502,7 +2695,7 @@ export const editorTools = [
       },
       required: ["name"],
     },
-    handler: async (params) => JSON.stringify(await bridge.findByName(params), null, 2),
+    handler: async (params) => formatResult(await bridge.findByName(params)),
   },
   {
     name: "unity_search_by_shader",
@@ -2515,7 +2708,7 @@ export const editorTools = [
       },
       required: ["shader"],
     },
-    handler: async (params) => JSON.stringify(await bridge.findByShader(params), null, 2),
+    handler: async (params) => formatResult(await bridge.findByShader(params)),
   },
   {
     name: "unity_search_assets",
@@ -2529,7 +2722,7 @@ export const editorTools = [
         maxResults: { type: "number", description: "Maximum results to return (default: 100)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.searchAssets(params), null, 2),
+    handler: async (params) => formatResult(await bridge.searchAssets(params)),
   },
   {
     name: "unity_search_missing_references",
@@ -2541,13 +2734,13 @@ export const editorTools = [
         limit: { type: "number", description: "Maximum results to return (default: 500)." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.findMissingReferences(params), null, 2),
+    handler: async (params) => formatResult(await bridge.findMissingReferences(params)),
   },
   {
     name: "unity_scene_stats",
     description: "Get comprehensive scene statistics: total objects, vertices, triangles, lights, cameras, colliders, and top component types.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getSceneStats(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getSceneStats(params)),
   },
 
   // â”€â”€â”€ Project Settings â”€â”€â”€
@@ -2555,7 +2748,7 @@ export const editorTools = [
     name: "unity_settings_quality",
     description: "Get current quality settings: level, shadows, anti-aliasing, LOD bias, vsync, and all quality levels available.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getQualitySettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getQualitySettings(params)),
   },
   {
     name: "unity_settings_set_quality_level",
@@ -2567,13 +2760,13 @@ export const editorTools = [
       },
       required: ["level"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setQualityLevel(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setQualityLevel(params)),
   },
   {
     name: "unity_settings_physics",
     description: "Get physics settings: gravity, solver iterations, sleep threshold, contact offset, bounce threshold.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getPhysicsSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPhysicsSettings(params)),
   },
   {
     name: "unity_settings_set_physics",
@@ -2589,13 +2782,13 @@ export const editorTools = [
         queriesHitTriggers: { type: "boolean", description: "Whether raycasts hit trigger colliders" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setPhysicsSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setPhysicsSettings(params)),
   },
   {
     name: "unity_settings_time",
     description: "Get time settings: fixedDeltaTime, maximumDeltaTime, timeScale.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getTimeSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTimeSettings(params)),
   },
   {
     name: "unity_settings_set_time",
@@ -2608,13 +2801,13 @@ export const editorTools = [
         timeScale: { type: "number", description: "Time scale (1 = normal, 0.5 = half speed, 2 = double speed)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setTimeSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTimeSettings(params)),
   },
   {
     name: "unity_settings_player",
     description: "Get player settings: company name, product name, version, color space, scripting backend, target architecture.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getPlayerSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPlayerSettings(params)),
   },
   {
     name: "unity_settings_set_player",
@@ -2628,33 +2821,53 @@ export const editorTools = [
         runInBackground: { type: "boolean", description: "Run in background when unfocused" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setPlayerSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setPlayerSettings(params)),
   },
   {
     name: "unity_settings_render_pipeline",
     description: "Get information about the current render pipeline (Built-in, URP, HDRP).",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getRenderPipelineInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getRenderPipelineInfo(params)),
   },
 
   // â”€â”€â”€ Undo â”€â”€â”€
   {
     name: "unity_undo",
-    description: "Undo the last operation in Unity Editor.",
+    description: "Undo the single most recent step on Unity's global undo stack (Ctrl+Z). To revert a specific MCP action, prefer unity_undo_last.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.performUndo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.performUndo(params)),
+  },
+  {
+    name: "unity_undo_last",
+    description:
+      "Revert the most recent undoable MCP action as a whole (create/edit/boolean, not one internal step — each write runs in its own named undo group). With agentId, targets that agent's most recent action. " +
+      "Unity's undo is LINEAR: reverting an action also reverts anything newer stacked on it, so this refuses to cascade and lists what would be affected unless force:true. (execute-code and reads are never targets.)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agentId: { type: "string", description: "Optional: revert this agent's most recent action instead of the global newest (see unity_undo_history for ids)." },
+        force: { type: "boolean", description: "Also revert newer actions stacked on top of the target (Unity's linear undo). Default false." },
+      },
+    },
+    handler: async (params) => formatResult(await bridge.undoLast(params)),
   },
   {
     name: "unity_redo",
     description: "Redo the last undone operation in Unity Editor.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.performRedo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.performRedo(params)),
   },
   {
     name: "unity_undo_history",
-    description: "Get information about the current undo group.",
-    inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getUndoHistory(params), null, 2),
+    description: "List recent MCP actions with undo state: per-agent attribution, whether each is still undoable, target, and the current undo group. Use it to decide what unity_undo_last reverts or to pick an agentId.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        count: { type: "number", description: "Max actions to return, newest first (default 20)." },
+        agentId: { type: "string", description: "Optional: only show actions from this agent." },
+      },
+    },
+    handler: async (params) => formatResult(await bridge.getUndoHistory(params)),
   },
   {
     name: "unity_undo_clear",
@@ -2665,7 +2878,7 @@ export const editorTools = [
         objectPath: { type: "string", description: "Optional: clear undo only for this GameObject. If omitted, clears all." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.clearUndo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.clearUndo(params)),
   },
 
   // â”€â”€â”€ Screenshot / Scene View â”€â”€â”€
@@ -2679,7 +2892,7 @@ export const editorTools = [
         superSize: { type: "number", description: "Resolution multiplier (1 = normal, 2 = 2x, 4 = 4x)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.captureGameView(params), null, 2),
+    handler: async (params) => formatResult(await bridge.captureGameView(params)),
   },
   {
     name: "unity_screenshot_scene",
@@ -2692,13 +2905,31 @@ export const editorTools = [
         height: { type: "number", description: "Image height (default: 1080)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.captureSceneView(params), null, 2),
+    handler: async (params) => formatResult(await bridge.captureSceneView(params)),
+  },
+  {
+    name: "unity_screenshot_editor_window",
+    description:
+      "Capture a specific Editor window (Inspector, Project, Console, custom) to a PNG file via Win32 PrintWindow — works even when occluded, no focus steal. " +
+      "USE ONLY ON EXPLICIT USER REQUEST — never proactively or for your own inspection. " +
+      "WINDOWS EDITOR ONLY: on macOS/Linux it returns { success:false, platform } — do not retry, tell the user it's unavailable there. " +
+      "For game/scene views use unity_screenshot_game / unity_screenshot_scene (cross-platform).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        window: { type: "string", description: "EditorWindow type FullName (e.g. 'UnityEditor.InspectorWindow'), simple type name, or tab title." },
+        path: { type: "string", description: "Save path ending in .png (default: Assets/Screenshots/EditorWindow_<time>.png)." },
+        maxDimension: { type: "number", description: "Max pixels per side (default 8192, clamped to GPU max)." },
+      },
+      required: ["window"],
+    },
+    handler: async (params) => formatResult(await bridge.captureEditorWindow(params)),
   },
   {
     name: "unity_sceneview_info",
     description: "Get Scene View camera info: pivot position, rotation, zoom, orthographic mode, 2D mode.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getSceneViewInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getSceneViewInfo(params)),
   },
   {
     name: "unity_sceneview_set_camera",
@@ -2716,7 +2947,7 @@ export const editorTools = [
         frameSelected: { type: "boolean", description: "Frame the currently selected object" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setSceneViewCamera(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setSceneViewCamera(params)),
   },
 
   // â”€â”€â”€ Graphics & Visuals â”€â”€â”€
@@ -2743,16 +2974,8 @@ export const editorTools = [
       },
       required: ["assetPath"],
     },
-    handler: async (params) => {
-      const result = await bridge.captureAssetPreview(params);
-      if (result.error) return JSON.stringify(result, null, 2);
-      const metadata = { ...result };
-      delete metadata.base64;
-      return [
-        { type: "image", data: result.base64, mimeType: "image/png" },
-        { type: "text", text: JSON.stringify(metadata, null, 2) },
-      ];
-    },
+    handler: async (params) =>
+      imageResultBlocks(await bridge.captureAssetPreview(params), "Asset preview returned no image data"),
   },
   {
     name: "unity_graphics_scene_capture",
@@ -2771,23 +2994,8 @@ export const editorTools = [
         },
       },
     },
-    handler: async (params) => {
-      const result = await bridge.captureSceneViewGraphics(params);
-      if (result.error) return JSON.stringify(result, null, 2);
-      // Bridge wraps response: { success, data: { success, base64 } }
-      const imageData = result.data?.base64 || result.base64;
-      if (!imageData || typeof imageData !== "string") {
-        return JSON.stringify({ error: "Scene capture returned no image data", ...result }, null, 2);
-      }
-      const metadata = { ...result };
-      delete metadata.base64;
-      if (metadata.data) delete metadata.data.base64;
-      const b64 = imageData.replace(/^data:image\/\w+;base64,/, "");
-      return [
-        { type: "image", data: b64, mimeType: "image/png" },
-        { type: "text", text: JSON.stringify(metadata, null, 2) },
-      ];
-    },
+    handler: async (params) =>
+      imageResultBlocks(await bridge.captureSceneViewGraphics(params), "Scene capture returned no image data"),
   },
   {
     name: "unity_graphics_game_capture",
@@ -2811,23 +3019,8 @@ export const editorTools = [
         },
       },
     },
-    handler: async (params) => {
-      const result = await bridge.captureGameViewGraphics(params);
-      if (result.error) return JSON.stringify(result, null, 2);
-      // Bridge wraps response: { success, data: { success, base64 } }
-      const imageData = result.data?.base64 || result.base64;
-      if (!imageData || typeof imageData !== "string") {
-        return JSON.stringify({ error: "Game capture returned no image data", ...result }, null, 2);
-      }
-      const metadata = { ...result };
-      delete metadata.base64;
-      if (metadata.data) delete metadata.data.base64;
-      const b64 = imageData.replace(/^data:image\/\w+;base64,/, "");
-      return [
-        { type: "image", data: b64, mimeType: "image/png" },
-        { type: "text", text: JSON.stringify(metadata, null, 2) },
-      ];
-    },
+    handler: async (params) =>
+      imageResultBlocks(await bridge.captureGameViewGraphics(params), "Game capture returned no image data"),
   },
   {
     name: "unity_graphics_prefab_render",
@@ -2866,16 +3059,8 @@ export const editorTools = [
       },
       required: ["assetPath"],
     },
-    handler: async (params) => {
-      const result = await bridge.renderPrefabPreview(params);
-      if (result.error) return JSON.stringify(result, null, 2);
-      const metadata = { ...result };
-      delete metadata.base64;
-      return [
-        { type: "image", data: result.base64, mimeType: "image/png" },
-        { type: "text", text: JSON.stringify(metadata, null, 2) },
-      ];
-    },
+    handler: async (params) =>
+      imageResultBlocks(await bridge.renderPrefabPreview(params), "Prefab render returned no image data"),
   },
   {
     name: "unity_graphics_mesh_info",
@@ -2897,7 +3082,7 @@ export const editorTools = [
       },
     },
     handler: async (params) =>
-      JSON.stringify(await bridge.getMeshInfo(params), null, 2),
+      formatResult(await bridge.getMeshInfo(params)),
   },
   {
     name: "unity_graphics_material_info",
@@ -2930,16 +3115,10 @@ export const editorTools = [
     },
     handler: async (params) => {
       const result = await bridge.getMaterialInfo(params);
-      if (result.error) return JSON.stringify(result, null, 2);
-      if (result.base64) {
-        const metadata = { ...result };
-        delete metadata.base64;
-        return [
-          { type: "image", data: result.base64, mimeType: "image/png" },
-          { type: "text", text: JSON.stringify(metadata, null, 2) },
-        ];
-      }
-      return JSON.stringify(result, null, 2);
+      const hasImage = typeof (result.data?.base64 || result.base64) === "string";
+      return hasImage
+        ? imageResultBlocks(result, "Material preview returned no image data")
+        : formatResult(result);
     },
   },
   {
@@ -2964,16 +3143,10 @@ export const editorTools = [
     },
     handler: async (params) => {
       const result = await bridge.getTextureInfoGraphics(params);
-      if (result.error) return JSON.stringify(result, null, 2);
-      if (result.base64) {
-        const metadata = { ...result };
-        delete metadata.base64;
-        return [
-          { type: "image", data: result.base64, mimeType: "image/png" },
-          { type: "text", text: JSON.stringify(metadata, null, 2) },
-        ];
-      }
-      return JSON.stringify(result, null, 2);
+      const hasImage = typeof (result.data?.base64 || result.base64) === "string";
+      return hasImage
+        ? imageResultBlocks(result, "Texture preview returned no image data")
+        : formatResult(result);
     },
   },
   {
@@ -2991,7 +3164,7 @@ export const editorTools = [
       required: ["objectPath"],
     },
     handler: async (params) =>
-      JSON.stringify(await bridge.getRendererInfo(params), null, 2),
+      formatResult(await bridge.getRendererInfo(params)),
   },
   {
     name: "unity_graphics_lighting_summary",
@@ -3008,7 +3181,7 @@ export const editorTools = [
       },
     },
     handler: async (params) =>
-      JSON.stringify(await bridge.getLightingSummary(params), null, 2),
+      formatResult(await bridge.getLightingSummary(params)),
   },
 
   // â”€â”€â”€ Terrain â”€â”€â”€
@@ -3025,9 +3198,10 @@ export const editorTools = [
         heightmapResolution: { type: "number", description: "Heightmap resolution, must be power of 2 + 1 (default: 513)" },
         position: { type: "object", description: "World position { x, y, z }", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
         dataPath: { type: "string", description: "Path to save terrain data asset (default: Assets/TerrainName_Data.asset)" },
+        overwrite: { type: "boolean", description: "Replace existing terrain data at dataPath (default false: refuse, to avoid wiping a sculpted terrain)." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.createTerrain(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createTerrain(params)),
   },
   {
     name: "unity_terrain_info",
@@ -3038,7 +3212,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name. If omitted, uses the active terrain." },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getTerrainInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTerrainInfo(params)),
   },
   {
     name: "unity_terrain_set_height",
@@ -3054,7 +3228,7 @@ export const editorTools = [
       },
       required: ["x", "z", "height"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTerrainHeight(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTerrainHeight(params)),
   },
   {
     name: "unity_terrain_flatten",
@@ -3066,7 +3240,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.flattenTerrain(params), null, 2),
+    handler: async (params) => formatResult(await bridge.flattenTerrain(params)),
   },
   {
     name: "unity_terrain_add_layer",
@@ -3082,7 +3256,7 @@ export const editorTools = [
       },
       required: ["texturePath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addTerrainLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addTerrainLayer(params)),
   },
   {
     name: "unity_terrain_get_height",
@@ -3096,13 +3270,13 @@ export const editorTools = [
       },
       required: ["worldX", "worldZ"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getTerrainHeight(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTerrainHeight(params)),
   },
   {
     name: "unity_terrain_list",
     description: "List all terrains in the scene with their names, positions, sizes, and basic info.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.listTerrains(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listTerrains(params)),
   },
   {
     name: "unity_terrain_raise_lower",
@@ -3119,7 +3293,7 @@ export const editorTools = [
       },
       required: ["x", "z", "delta"],
     },
-    handler: async (params) => JSON.stringify(await bridge.raiseLowerTerrainHeight(params), null, 2),
+    handler: async (params) => formatResult(await bridge.raiseLowerTerrainHeight(params)),
   },
   {
     name: "unity_terrain_smooth",
@@ -3135,7 +3309,7 @@ export const editorTools = [
       },
       required: ["x", "z"],
     },
-    handler: async (params) => JSON.stringify(await bridge.smoothTerrainHeight(params), null, 2),
+    handler: async (params) => formatResult(await bridge.smoothTerrainHeight(params)),
   },
   {
     name: "unity_terrain_noise",
@@ -3151,7 +3325,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setTerrainNoise(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTerrainNoise(params)),
   },
   {
     name: "unity_terrain_set_heights_region",
@@ -3166,7 +3340,7 @@ export const editorTools = [
       },
       required: ["xBase", "yBase", "heights"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTerrainHeightsRegion(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTerrainHeightsRegion(params)),
   },
   {
     name: "unity_terrain_get_heights_region",
@@ -3182,7 +3356,7 @@ export const editorTools = [
       },
       required: ["xBase", "yBase", "width", "height"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getTerrainHeightsRegion(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTerrainHeightsRegion(params)),
   },
   {
     name: "unity_terrain_remove_layer",
@@ -3195,7 +3369,7 @@ export const editorTools = [
       },
       required: ["layerIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeTerrainLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeTerrainLayer(params)),
   },
   {
     name: "unity_terrain_paint_layer",
@@ -3213,7 +3387,7 @@ export const editorTools = [
       },
       required: ["x", "z", "layerIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.paintTerrainLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.paintTerrainLayer(params)),
   },
   {
     name: "unity_terrain_fill_layer",
@@ -3226,7 +3400,7 @@ export const editorTools = [
       },
       required: ["layerIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.fillTerrainLayer(params), null, 2),
+    handler: async (params) => formatResult(await bridge.fillTerrainLayer(params)),
   },
   {
     name: "unity_terrain_add_tree_prototype",
@@ -3240,7 +3414,7 @@ export const editorTools = [
       },
       required: ["prefabPath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addTerrainTreePrototype(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addTerrainTreePrototype(params)),
   },
   {
     name: "unity_terrain_remove_tree_prototype",
@@ -3253,7 +3427,7 @@ export const editorTools = [
       },
       required: ["prototypeIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removeTerrainTreePrototype(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removeTerrainTreePrototype(params)),
   },
   {
     name: "unity_terrain_place_trees",
@@ -3277,7 +3451,7 @@ export const editorTools = [
       },
       required: ["prototypeIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.placeTerrainTrees(params), null, 2),
+    handler: async (params) => formatResult(await bridge.placeTerrainTrees(params)),
   },
   {
     name: "unity_terrain_clear_trees",
@@ -3289,7 +3463,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.clearTerrainTrees(params), null, 2),
+    handler: async (params) => formatResult(await bridge.clearTerrainTrees(params)),
   },
   {
     name: "unity_terrain_get_tree_instances",
@@ -3301,7 +3475,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getTerrainTreeInstances(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTerrainTreeInstances(params)),
   },
   {
     name: "unity_terrain_add_detail_prototype",
@@ -3320,7 +3494,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.addTerrainDetailPrototype(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addTerrainDetailPrototype(params)),
   },
   {
     name: "unity_terrain_paint_detail",
@@ -3337,7 +3511,7 @@ export const editorTools = [
       },
       required: ["x", "z", "detailIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.paintTerrainDetail(params), null, 2),
+    handler: async (params) => formatResult(await bridge.paintTerrainDetail(params)),
   },
   {
     name: "unity_terrain_scatter_detail",
@@ -3353,7 +3527,7 @@ export const editorTools = [
       },
       required: ["detailIndex"],
     },
-    handler: async (params) => JSON.stringify(await bridge.scatterTerrainDetail(params), null, 2),
+    handler: async (params) => formatResult(await bridge.scatterTerrainDetail(params)),
   },
   {
     name: "unity_terrain_clear_detail",
@@ -3365,7 +3539,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.clearTerrainDetail(params), null, 2),
+    handler: async (params) => formatResult(await bridge.clearTerrainDetail(params)),
   },
   {
     name: "unity_terrain_set_holes",
@@ -3380,7 +3554,7 @@ export const editorTools = [
       },
       required: ["xBase", "yBase", "holes"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTerrainHoles(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTerrainHoles(params)),
   },
   {
     name: "unity_terrain_set_settings",
@@ -3402,7 +3576,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setTerrainSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTerrainSettings(params)),
   },
   {
     name: "unity_terrain_resize",
@@ -3417,7 +3591,7 @@ export const editorTools = [
         name: { type: "string", description: "Terrain name (optional)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.resizeTerrain(params), null, 2),
+    handler: async (params) => formatResult(await bridge.resizeTerrain(params)),
   },
   {
     name: "unity_terrain_create_grid",
@@ -3436,7 +3610,7 @@ export const editorTools = [
       },
       required: ["rows", "cols"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createTerrainGrid(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createTerrainGrid(params)),
   },
   {
     name: "unity_terrain_set_neighbors",
@@ -3452,7 +3626,7 @@ export const editorTools = [
       },
       required: ["terrain"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTerrainNeighbors(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTerrainNeighbors(params)),
   },
   {
     name: "unity_terrain_import_heightmap",
@@ -3467,7 +3641,7 @@ export const editorTools = [
       },
       required: ["filePath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.importTerrainHeightmap(params), null, 2),
+    handler: async (params) => formatResult(await bridge.importTerrainHeightmap(params)),
   },
   {
     name: "unity_terrain_export_heightmap",
@@ -3481,7 +3655,7 @@ export const editorTools = [
       },
       required: ["filePath"],
     },
-    handler: async (params) => JSON.stringify(await bridge.exportTerrainHeightmap(params), null, 2),
+    handler: async (params) => formatResult(await bridge.exportTerrainHeightmap(params)),
   },
   {
     name: "unity_terrain_get_steepness",
@@ -3495,7 +3669,7 @@ export const editorTools = [
       },
       required: ["worldX", "worldZ"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getTerrainSteepness(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTerrainSteepness(params)),
   },
 
   // â”€â”€â”€ Particle System â”€â”€â”€
@@ -3517,7 +3691,7 @@ export const editorTools = [
         gravityModifier: { type: "number", description: "Gravity multiplier" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.createParticleSystem(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createParticleSystem(params)),
   },
   {
     name: "unity_particle_info",
@@ -3526,10 +3700,10 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "number", description: "Instance ID (alternative)" },
+        instanceId: { type: "string", description: "Instance ID (alternative)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.getParticleSystemInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getParticleSystemInfo(params)),
   },
   {
     name: "unity_particle_set_main",
@@ -3538,7 +3712,7 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "number", description: "Instance ID (alternative)" },
+        instanceId: { type: "string", description: "Instance ID (alternative)" },
         duration: { type: "number" }, loop: { type: "boolean" },
         startLifetime: { type: "number" }, startSpeed: { type: "number" },
         startSize: { type: "number" }, startRotation: { type: "number" },
@@ -3547,7 +3721,7 @@ export const editorTools = [
         simulationSpace: { type: "string", description: "Local, World, or Custom" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setParticleMainModule(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setParticleMainModule(params)),
   },
   {
     name: "unity_particle_set_emission",
@@ -3556,13 +3730,13 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "number", description: "Instance ID (alternative)" },
+        instanceId: { type: "string", description: "Instance ID (alternative)" },
         enabled: { type: "boolean" },
         rateOverTime: { type: "number", description: "Particles emitted per second" },
         rateOverDistance: { type: "number", description: "Particles emitted per unit distance" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setParticleEmission(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setParticleEmission(params)),
   },
   {
     name: "unity_particle_set_shape",
@@ -3571,14 +3745,14 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "number", description: "Instance ID (alternative)" },
+        instanceId: { type: "string", description: "Instance ID (alternative)" },
         enabled: { type: "boolean" },
         shapeType: { type: "string", description: "Shape type: Sphere, Hemisphere, Cone, Box, Circle, Edge, Rectangle, etc." },
         radius: { type: "number" }, angle: { type: "number" },
         arc: { type: "number" }, radiusThickness: { type: "number", description: "0 = emit from surface only, 1 = emit from entire volume" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.setParticleShape(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setParticleShape(params)),
   },
   {
     name: "unity_particle_playback",
@@ -3587,12 +3761,12 @@ export const editorTools = [
       type: "object",
       properties: {
         path: { type: "string", description: "GameObject path" },
-        instanceId: { type: "number", description: "Instance ID (alternative)" },
+        instanceId: { type: "string", description: "Instance ID (alternative)" },
         action: { type: "string", description: "play, stop, pause, restart, or clear" },
       },
       required: ["action"],
     },
-    handler: async (params) => JSON.stringify(await bridge.particlePlayback(params), null, 2),
+    handler: async (params) => formatResult(await bridge.particlePlayback(params)),
   },
 
   // â”€â”€â”€ ScriptableObject â”€â”€â”€
@@ -3604,10 +3778,11 @@ export const editorTools = [
       properties: {
         type: { type: "string", description: "Full type name (e.g. 'GameSettings', 'MyNamespace.PlayerData')" },
         path: { type: "string", description: "Asset path (default: Assets/TypeName.asset)" },
+        overwrite: { type: "boolean", description: "Replace an existing asset at this path (default false: refuse, to avoid resetting tuned data)." },
       },
       required: ["type"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createScriptableObject(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createScriptableObject(params)),
   },
   {
     name: "unity_scriptableobject_info",
@@ -3619,7 +3794,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getScriptableObjectInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getScriptableObjectInfo(params)),
   },
   {
     name: "unity_scriptableobject_set_field",
@@ -3629,11 +3804,11 @@ export const editorTools = [
       properties: {
         path: { type: "string", description: "Asset path of the ScriptableObject" },
         field: { type: "string", description: "Property/field name" },
-        value: { description: "Value to set (type depends on field)" },
+        value: { type: ["string", "number", "boolean", "object", "array", "null"], description: "Value to set (type depends on field)" },
       },
       required: ["path", "field", "value"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setScriptableObjectField(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setScriptableObjectField(params)),
   },
   {
     name: "unity_scriptableobject_list_types",
@@ -3645,7 +3820,7 @@ export const editorTools = [
         includeEngine: { type: "boolean", description: "Include Unity engine types (default: false, project types only)" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.listScriptableObjectTypes(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listScriptableObjectTypes(params)),
   },
 
   // â”€â”€â”€ Texture â”€â”€â”€
@@ -3659,7 +3834,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getTextureInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getTextureInfo(params)),
   },
   {
     name: "unity_texture_set_import",
@@ -3684,7 +3859,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTextureImportSettings(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTextureImportSettings(params)),
   },
   {
     name: "unity_texture_reimport",
@@ -3696,7 +3871,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.reimportTexture(params), null, 2),
+    handler: async (params) => formatResult(await bridge.reimportTexture(params)),
   },
   {
     name: "unity_texture_set_sprite",
@@ -3710,7 +3885,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTextureAsSprite(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTextureAsSprite(params)),
   },
   {
     name: "unity_texture_set_normalmap",
@@ -3722,7 +3897,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setTextureAsNormalMap(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setTextureAsNormalMap(params)),
   },
 
   // â”€â”€â”€ Navigation â”€â”€â”€
@@ -3739,13 +3914,13 @@ export const editorTools = [
         agentClimb: { type: "number", description: "Step height the agent can climb" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.bakeNavMesh(params), null, 2),
+    handler: async (params) => formatResult(await bridge.bakeNavMesh(params)),
   },
   {
     name: "unity_navmesh_clear",
     description: "Clear all baked NavMeshes from the scene.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.clearNavMesh(params), null, 2),
+    handler: async (params) => formatResult(await bridge.clearNavMesh(params)),
   },
   {
     name: "unity_navmesh_add_agent",
@@ -3763,7 +3938,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addNavMeshAgent(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addNavMeshAgent(params)),
   },
   {
     name: "unity_navmesh_add_obstacle",
@@ -3777,13 +3952,13 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addNavMeshObstacle(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addNavMeshObstacle(params)),
   },
   {
     name: "unity_navmesh_info",
     description: "Get NavMesh information: vertex/triangle count, agents, obstacles, agent types.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getNavMeshInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getNavMeshInfo(params)),
   },
   {
     name: "unity_navmesh_set_destination",
@@ -3800,7 +3975,7 @@ export const editorTools = [
       },
       required: ["path", "destination"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setAgentDestination(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setAgentDestination(params)),
   },
 
   // â”€â”€â”€ UI â”€â”€â”€
@@ -3815,7 +3990,7 @@ export const editorTools = [
         renderMode: { type: "string", description: "Render mode: overlay, camera, or world" },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.createCanvas(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createCanvas(params)),
   },
   {
     name: "unity_ui_create_element",
@@ -3832,13 +4007,13 @@ export const editorTools = [
       },
       required: ["type"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createUIElement(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createUIElement(params)),
   },
   {
     name: "unity_ui_info",
     description: "Get UI information: canvases, text/image/button counts.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.getUIInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getUIInfo(params)),
   },
   {
     name: "unity_ui_set_text",
@@ -3854,7 +4029,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setUIText(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setUIText(params)),
   },
   {
     name: "unity_ui_set_image",
@@ -3870,7 +4045,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setUIImage(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setUIImage(params)),
   },
 
   // â”€â”€â”€ Package Manager â”€â”€â”€
@@ -3879,7 +4054,7 @@ export const editorTools = [
     name: "unity_packages_list",
     description: "List all installed Unity packages with their name, version, source, and status.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.listPackages(params), null, 2),
+    handler: async (params) => formatResult(await bridge.listPackages(params)),
   },
   {
     name: "unity_packages_add",
@@ -3891,7 +4066,7 @@ export const editorTools = [
       },
       required: ["identifier"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addPackage(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addPackage(params)),
   },
   {
     name: "unity_packages_remove",
@@ -3903,7 +4078,7 @@ export const editorTools = [
       },
       required: ["name"],
     },
-    handler: async (params) => JSON.stringify(await bridge.removePackage(params), null, 2),
+    handler: async (params) => formatResult(await bridge.removePackage(params)),
   },
   {
     name: "unity_packages_search",
@@ -3915,7 +4090,7 @@ export const editorTools = [
       },
       required: ["query"],
     },
-    handler: async (params) => JSON.stringify(await bridge.searchPackage(params), null, 2),
+    handler: async (params) => formatResult(await bridge.searchPackage(params)),
   },
   {
     name: "unity_packages_info",
@@ -3927,7 +4102,7 @@ export const editorTools = [
       },
       required: ["name"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getPackageInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPackageInfo(params)),
   },
 
   // â”€â”€â”€ Constraints & LOD â”€â”€â”€
@@ -3945,7 +4120,7 @@ export const editorTools = [
       },
       required: ["path", "type"],
     },
-    handler: async (params) => JSON.stringify(await bridge.addConstraint(params), null, 2),
+    handler: async (params) => formatResult(await bridge.addConstraint(params)),
   },
   {
     name: "unity_constraint_info",
@@ -3957,7 +4132,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getConstraintInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getConstraintInfo(params)),
   },
   {
     name: "unity_lod_create",
@@ -3970,7 +4145,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.createLODGroup(params), null, 2),
+    handler: async (params) => formatResult(await bridge.createLODGroup(params)),
   },
   {
     name: "unity_lod_info",
@@ -3982,7 +4157,7 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getLODGroupInfo(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getLODGroupInfo(params)),
   },
 
   // â”€â”€â”€ Prefs â”€â”€â”€
@@ -3998,7 +4173,7 @@ export const editorTools = [
       },
       required: ["key"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getEditorPref(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getEditorPref(params)),
   },
   {
     name: "unity_editorprefs_set",
@@ -4007,12 +4182,12 @@ export const editorTools = [
       type: "object",
       properties: {
         key: { type: "string", description: "Preference key" },
-        value: { description: "Value to set" },
+        value: { type: ["string", "number", "boolean"], description: "Value to set" },
         type: { type: "string", description: "Value type: string, int, float, bool" },
       },
       required: ["key", "value"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setEditorPref(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setEditorPref(params)),
   },
   {
     name: "unity_editorprefs_delete",
@@ -4024,7 +4199,7 @@ export const editorTools = [
       },
       required: ["key"],
     },
-    handler: async (params) => JSON.stringify(await bridge.deleteEditorPref(params), null, 2),
+    handler: async (params) => formatResult(await bridge.deleteEditorPref(params)),
   },
   {
     name: "unity_playerprefs_get",
@@ -4037,7 +4212,7 @@ export const editorTools = [
       },
       required: ["key"],
     },
-    handler: async (params) => JSON.stringify(await bridge.getPlayerPref(params), null, 2),
+    handler: async (params) => formatResult(await bridge.getPlayerPref(params)),
   },
   {
     name: "unity_playerprefs_set",
@@ -4046,12 +4221,12 @@ export const editorTools = [
       type: "object",
       properties: {
         key: { type: "string", description: "Preference key" },
-        value: { description: "Value to set" },
+        value: { type: ["string", "number"], description: "Value to set" },
         type: { type: "string", description: "Value type: string, int, float" },
       },
       required: ["key", "value"],
     },
-    handler: async (params) => JSON.stringify(await bridge.setPlayerPref(params), null, 2),
+    handler: async (params) => formatResult(await bridge.setPlayerPref(params)),
   },
   {
     name: "unity_playerprefs_delete",
@@ -4063,13 +4238,13 @@ export const editorTools = [
       },
       required: ["key"],
     },
-    handler: async (params) => JSON.stringify(await bridge.deletePlayerPref(params), null, 2),
+    handler: async (params) => formatResult(await bridge.deletePlayerPref(params)),
   },
   {
     name: "unity_playerprefs_delete_all",
     description: "Delete ALL PlayerPrefs. Use with caution.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (params) => JSON.stringify(await bridge.deleteAllPlayerPrefs(params), null, 2),
+    handler: async (params) => formatResult(await bridge.deleteAllPlayerPrefs(params)),
   },
 
   // â”€â”€â”€ Queue Management (Multi-Agent) â”€â”€â”€
@@ -4078,7 +4253,7 @@ export const editorTools = [
     description:
       "Get the current state of the multi-agent request queue: total queued requests, active agents, per-agent queue depths, and completed cache size. Useful for monitoring when multiple agents are working on the same Unity project.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.getQueueInfo(), null, 2),
+    handler: async () => formatResult(await bridge.getQueueInfo()),
   },
   {
     name: "unity_queue_ticket_status",
@@ -4095,14 +4270,14 @@ export const editorTools = [
       required: ["ticketId"],
     },
     handler: async ({ ticketId }) =>
-      JSON.stringify(await bridge.getTicketStatus(ticketId), null, 2),
+      formatResult(await bridge.getTicketStatus(ticketId)),
   },
   {
     name: "unity_agents_list",
     description:
       "List all active agent sessions connected to the AB Unity MCP bridge. Shows each agent's ID, connection time, last activity, current action, total actions count, queued/completed request counts, and average response time.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.listAgents(), null, 2),
+    handler: async () => formatResult(await bridge.listAgents()),
   },
   {
     name: "unity_agent_log",
@@ -4119,7 +4294,7 @@ export const editorTools = [
       required: ["agentId"],
     },
     handler: async (params) =>
-      JSON.stringify(await bridge.getAgentLog(params), null, 2),
+      formatResult(await bridge.getAgentLog(params)),
   },
 
   // â”€â”€â”€ MPPM Scenario Management â”€â”€â”€
@@ -4129,13 +4304,13 @@ export const editorTools = [
     name: "unity_mppm_list_scenarios",
     description: "List all MPPM (Multiplayer PlayMode) scenarios in the project with details about instances and configurations.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/list", {}), null, 2),
+    handler: async () => formatResult(await bridge.sendCommand("scenario/list", {})),
   },
   {
     name: "unity_mppm_status",
     description: "Get the current scenario status including running state, active scenario name, and progress.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/status", {}), null, 2),
+    handler: async () => formatResult(await bridge.sendCommand("scenario/status", {})),
   },
   {
     name: "unity_mppm_activate_scenario",
@@ -4147,25 +4322,123 @@ export const editorTools = [
       },
       required: ["path"],
     },
-    handler: async ({ path }) => JSON.stringify(await bridge.sendCommand("scenario/activate", { path }), null, 2),
+    handler: async ({ path }) => formatResult(await bridge.sendCommand("scenario/activate", { path })),
   },
   {
     name: "unity_mppm_start",
-    description: "Start the currently active scenario.",
-    inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/start", {}), null, 2),
+    description:
+      "Start the currently active scenario. By default also enters Play mode on the main editor " +
+      "so MPPM's Play-mode hooks fire (virtual players launch, scene tick starts). " +
+      "Set enterPlayMode=false to only mark the scenario running without entering Play.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        enterPlayMode: {
+          type: "boolean",
+          description: "Enter Play mode after starting the scenario. Default true.",
+        },
+      },
+    },
+    handler: async (args) =>
+      formatResult(await bridge.sendCommand("scenario/start", args || {})),
   },
   {
     name: "unity_mppm_stop",
-    description: "Stop the running scenario.",
-    inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/stop", {}), null, 2),
+    description:
+      "Stop the running scenario. By default also exits Play mode on the main editor so " +
+      "virtual-player processes shut down. Set exitPlayMode=false to leave Play mode running.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        exitPlayMode: {
+          type: "boolean",
+          description: "Exit Play mode after stopping the scenario. Default true.",
+        },
+      },
+    },
+    handler: async (args) =>
+      formatResult(await bridge.sendCommand("scenario/stop", args || {})),
   },
   {
     name: "unity_mppm_info",
     description: "Get multiplayer play mode information including CurrentPlayer state, tags, and MPPM package version.",
     inputSchema: { type: "object", properties: {} },
-    handler: async () => JSON.stringify(await bridge.sendCommand("scenario/info", {}), null, 2),
+    handler: async () => formatResult(await bridge.sendCommand("scenario/info", {})),
+  },
+  {
+    name: "unity_mppm_create_scenario",
+    description:
+      "Create an MPPM ScenarioConfig asset programmatically. Unity 6+ (MPPM 2.0). " +
+      "Produces 1 MainEditor instance + N VirtualEditor instances, saved as a .asset " +
+      "file you can then activate with unity_mppm_activate_scenario and run with unity_mppm_start.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Scenario name (also used as the default asset file name)." },
+        path: { type: "string", description: "Optional asset path. Defaults to 'Assets/MPPM/{name}.asset'." },
+        mainRole: {
+          type: "string",
+          enum: ["Host", "Client", "Server"],
+          description: "Role for the Main Editor instance. 'Host' = ClientAndServer (default).",
+        },
+        virtualEditors: {
+          type: "integer",
+          minimum: 0,
+          description: "Number of Virtual Editor instances (clones) to add. Default 1.",
+        },
+        virtualRole: {
+          type: "string",
+          enum: ["Client", "Server", "Host"],
+          description: "Role for each Virtual Editor instance. Default 'Client'.",
+        },
+        description: { type: "string", description: "Optional human-readable description." },
+      },
+      required: ["name"],
+    },
+    handler: async (args) =>
+      formatResult(await bridge.sendCommand("scenario/create", args || {})),
+  },
+
+  // ─── MPPM Virtual Players (direct lifecycle, no scenario asset needed) ───
+  {
+    name: "unity_mppm_list_players",
+    description:
+      "List the 4 MPPM virtual-player slots and their current state " +
+      "(NotLaunched / Launching / Launched / Communicative). Use this before " +
+      "activating a player to verify slot availability.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => formatResult(await bridge.sendCommand("mppm/list-players", {})),
+  },
+  {
+    name: "unity_mppm_activate_player",
+    description:
+      "Activate a Virtual Player (clone Unity Editor process). index must be 2, 3, or 4 " +
+      "(Player 1 is the main editor). Returns immediately while the player is in 'Launching' " +
+      "state — poll unity_mppm_list_players or unity_list_instances to detect when ready " +
+      "(typically 30-60s on a cold project). Refuses to activate if there are pending compile " +
+      "errors (returns ActivationError=CompileErrors).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        index: { type: "integer", description: "Player slot to activate: 2, 3, or 4.", minimum: 2, maximum: 4 },
+      },
+      required: ["index"],
+    },
+    handler: async ({ index }) => formatResult(await bridge.sendCommand("mppm/activate-player", { index })),
+  },
+  {
+    name: "unity_mppm_deactivate_player",
+    description:
+      "Deactivate a Virtual Player previously activated via unity_mppm_activate_player. " +
+      "index must be 2, 3, or 4.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        index: { type: "integer", description: "Player slot to deactivate: 2, 3, or 4.", minimum: 2, maximum: 4 },
+      },
+      required: ["index"],
+    },
+    handler: async ({ index }) => formatResult(await bridge.sendCommand("mppm/deactivate-player", { index })),
   },
 
   // ─── Testing ───
@@ -4200,7 +4473,11 @@ export const editorTools = [
         groupNames: {
           type: "array",
           items: { type: "string" },
-          description: "Run only tests in these groups",
+          description: "Regex patterns matched against the test fixture's FullName (Unity's Filter.groupNames). Class name like 'MountSmokeTests' runs every method on that class.",
+        },
+        filter: {
+          type: "string",
+          description: "Convenience alias forwarded into Unity's Filter.groupNames as a regex. Pass a class name (e.g. 'MountSmokeTests') or a regex; comma-separated values are split into multiple groupNames entries. Merges with any explicit groupNames array.",
         },
         clearStuck: {
           type: "boolean",
@@ -4210,18 +4487,18 @@ export const editorTools = [
     },
     handler: async (params) => {
       const result = await bridge.runTests(params);
-      // If the run started successfully, auto-poll for a few seconds to provide early feedback
-      if (result.jobId && result.status === "running") {
-        // Wait briefly then check for early results
+      // Bridge wraps handler payloads as { success, data:{...} }, so the jobId/status
+      // live under .data. Reading the top level made this early-feedback branch dead.
+      const started = result.data ?? result;
+      if (started.jobId && started.status === "running") {
         await new Promise((r) => setTimeout(r, 2000));
         try {
-          const status = await bridge.getTestJob({ jobId: result.jobId });
-          return JSON.stringify(status, null, 2);
+          return formatResult(await bridge.getTestJob({ jobId: started.jobId }));
         } catch (_) {
-          return JSON.stringify(result, null, 2);
+          return formatResult(result);
         }
       }
-      return JSON.stringify(result, null, 2);
+      return formatResult(result);
     },
   },
   {
@@ -4256,22 +4533,24 @@ export const editorTools = [
     handler: async (params) => {
       const waitTimeout = params?.waitTimeout;
       if (waitTimeout && waitTimeout > 0) {
-        // Server-side polling loop
+        // Server-side polling loop. Terminal status lives under .data (bridge envelope);
+        // reading the top level meant this never short-circuited and always burned the
+        // full timeout even when the run finished in seconds.
+        const TERMINAL = new Set(["succeeded", "failed", "error", "cancelled", "canceled", "completed", "timedout"]);
         const deadline = Date.now() + waitTimeout * 1000;
         let lastResult;
         while (Date.now() < deadline) {
           lastResult = await bridge.getTestJob(params);
-          const status = lastResult?.status;
-          if (status === "succeeded" || status === "failed") {
-            return JSON.stringify(lastResult, null, 2);
+          const status = (lastResult?.data?.status ?? lastResult?.status ?? "").toLowerCase();
+          if (TERMINAL.has(status)) {
+            return formatResult(lastResult);
           }
-          // Wait 2 seconds before next poll
           await new Promise((r) => setTimeout(r, 2000));
         }
         // Timeout — return last known state
-        return JSON.stringify(lastResult || (await bridge.getTestJob(params)), null, 2);
+        return formatResult(lastResult || (await bridge.getTestJob(params)));
       }
-      return JSON.stringify(await bridge.getTestJob(params), null, 2);
+      return formatResult(await bridge.getTestJob(params));
     },
   },
   {
@@ -4297,6 +4576,105 @@ export const editorTools = [
         },
       },
     },
-    handler: async (params) => JSON.stringify(await bridge.listTests(params || {}), null, 2),
+    handler: async (params) => formatResult(await bridge.listTests(params || {})),
+  },
+
+  // ─── Sprite Atlas ───
+
+  {
+    name: "unity_spriteatlas_create",
+    description: "Create a new SpriteAtlas asset at the given path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path (e.g. 'Assets/Atlases/MyAtlas.spriteatlas')" },
+        includeInBuild: { type: "boolean", description: "Include atlas in builds (default: true)" },
+      },
+      required: ["path"],
+    },
+    handler: async (params) => formatResult(await bridge.createSpriteAtlas(params)),
+  },
+  {
+    name: "unity_spriteatlas_info",
+    description: "Get SpriteAtlas details: packables, texture settings, packing settings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path of the SpriteAtlas" },
+      },
+      required: ["path"],
+    },
+    handler: async (params) => formatResult(await bridge.getSpriteAtlasInfo(params)),
+  },
+  {
+    name: "unity_spriteatlas_add",
+    description: "Add sprites, textures, or folders to a SpriteAtlas.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path of the SpriteAtlas" },
+        assetPaths: { type: "array", items: { type: "string" }, description: "Asset paths to add" },
+        assetPath: { type: "string", description: "Single asset path to add (alternative to assetPaths)" },
+      },
+      required: ["path"],
+    },
+    handler: async (params) => formatResult(await bridge.addToSpriteAtlas(params)),
+  },
+  {
+    name: "unity_spriteatlas_remove",
+    description: "Remove packables from a SpriteAtlas.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path of the SpriteAtlas" },
+        assetPaths: { type: "array", items: { type: "string" }, description: "Asset paths to remove" },
+        assetPath: { type: "string", description: "Single asset path to remove (alternative to assetPaths)" },
+      },
+      required: ["path"],
+    },
+    handler: async (params) => formatResult(await bridge.removeFromSpriteAtlas(params)),
+  },
+  {
+    name: "unity_spriteatlas_settings",
+    description: "Update SpriteAtlas packing and texture settings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path of the SpriteAtlas" },
+        includeInBuild: { type: "boolean", description: "Include in builds" },
+        enableRotation: { type: "boolean", description: "Allow sprite rotation during packing" },
+        enableTightPacking: { type: "boolean", description: "Use tight packing" },
+        padding: { type: "number", description: "Padding between sprites in pixels" },
+        readable: { type: "boolean", description: "Make atlas texture readable" },
+        generateMipMaps: { type: "boolean", description: "Generate mipmaps" },
+        sRGB: { type: "boolean", description: "Use sRGB color space" },
+        filterMode: { type: "string", description: "Texture filter mode (Point, Bilinear, Trilinear)" },
+      },
+      required: ["path"],
+    },
+    handler: async (params) => formatResult(await bridge.setSpriteAtlasSettings(params)),
+  },
+  {
+    name: "unity_spriteatlas_delete",
+    description: "Delete a SpriteAtlas asset.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Asset path of the SpriteAtlas to delete" },
+      },
+      required: ["path"],
+    },
+    handler: async (params) => formatResult(await bridge.deleteSpriteAtlas(params)),
+  },
+  {
+    name: "unity_spriteatlas_list",
+    description: "Find all SpriteAtlas assets in the project, optionally filtered by folder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folder: { type: "string", description: "Folder to search in (e.g. 'Assets/Atlases'). Omit to search entire project." },
+      },
+    },
+    handler: async (params) => formatResult(await bridge.listSpriteAtlases(params)),
   },
 ];
